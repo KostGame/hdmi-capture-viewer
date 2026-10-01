@@ -1,34 +1,46 @@
 # HDMI Capture Viewer
 
-**A lightweight, low-latency live preview for USB HDMI capture devices on Windows.**
+A small native Windows preview for UVC HDMI capture devices. This repository now contains an early vertical slice; it is not a validated low-latency release.
 
-> **Project status:** Planning. The application and installers are not available yet. Development is tracked in [Issue #1](https://github.com/KostGame/hdmi-capture-viewer/issues/1).
+## Current behavior
 
-## What this project aims to do
+- Starts as a resizable window with a 1920 × 1080 client area. The video is centered and scaled to preserve its aspect ratio.
+- Lists Media Foundation video capture devices and the native media types each device advertises in the **Device** and **Native format** menus. **Window → Rescan devices** refreshes the list.
+- Prefers advertised YUY2 1920 × 1080 near 60 fps. Otherwise it prefers the largest advertised YUY2 mode, then the largest other advertised mode. Choose a listed mode explicitly from the menu.
+- Requests the selected mode's dimensions and frame rate from the Media Foundation Source Reader. For YUY2 it requests YUY2 output with Media Foundation converters disabled, checks that the negotiated output subtype is YUY2, and converts packed YUY2 pixels to BGRA on the capture worker. For other selected profiles it requests RGB32 output, which may require Media Foundation decoding/conversion; the native input subtype is then explicitly reported as unconfirmed. A failed request reports the Media Foundation error; it does not silently select a different listed profile.
+- Initializes COM independently on the capture worker. Holds at most one pending frame and coalesces window-update notifications instead of accumulating a frame-message backlog. D3D11 presents the latest available image and the title shows render FPS, replaced-frame count, and callback-to-submit time. That time is not input-to-photon latency.
+- **Window → Borderless window** removes the frame while preserving the current client size and location; starting at the default 1920 × 1080 client size, the borderless preview can occupy one 4K desktop quadrant. Press F11 to restore the normal window. The normal window supports standard resize and Windows Snap.
 
-HDMI Capture Viewer is intended to do one thing: display a live HDMI capture feed in a desktop window, prioritizing **the freshest available frame** over buffered playback.
+No audio, recording, streaming, input forwarding, telemetry, or privileged system changes are included.
 
-Planned MVP features:
-- A resizable video window with a default 1920 × 1080 viewing area, suitable for a quarter of a 4K desktop.
-- Capture-device detection and selection of device-supported resolutions, frame rates, and pixel formats.
-- A low-buffering video path; prefer native YUY2 at 1080p60 **when the connected hardware can actually sustain it**.
-- Aspect-ratio-preserving scaling, normal/borderless/fullscreen modes, and remembered settings.
-- Optional diagnostics for capture and rendering performance.
+## Build on Windows
 
-## What it is not
+Use Visual Studio 2022 Build Tools or Visual Studio with the **Desktop development with C++** workload and a Windows 10/11 SDK. From an x64 Native Tools Command Prompt at the repository root:
 
-The initial release will not be a recorder, streaming studio, media player, or remote-desktop/KVM tool. Keyboard and mouse input remain connected to the HDMI source device; this viewer only displays its video.
+```bat
+cl /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp /Fe:hdmi-capture-viewer.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib shcore.lib
+```
 
-## Performance expectations
+The GitHub Actions workflow uses `windows-2022` and the x64 MSVC toolchain to build this executable. No release or installer is produced.
 
-Reducing **application-side** buffering is the design goal, not a promise of zero delay. Actual end-to-end latency depends on the capture device, USB connection, source, GPU, display, and Windows presentation path. Device-advertised formats and frame rates will be verified experimentally.
+The platform-independent one-slot frame queue check can be built on Linux with g++ 13 or later:
 
-## Implementation plan
+```sh
+g++ -std=c++20 -Wall -Wextra -Werror -pthread tests/latest_frame_tests.cpp -o /tmp/hcv-latest-frame-tests
+/tmp/hcv-latest-frame-tests
+```
 
-The initial architecture under evaluation is native C++20, Windows Media Foundation, and Direct3D 11. Implementation choices will be confirmed using real latency measurements rather than theoretical API comparisons.
+## Use
 
-See [HCV-001: Minimal low-latency HDMI/UVC preview](https://github.com/KostGame/hdmi-capture-viewer/issues/1) for the project scope, constraints, tests, and acceptance criteria.
+Connect and power the HDMI capture device before starting the app. If exactly one compatible video device is detected, the app opens its preferred advertised profile. If multiple devices are detected, choose the HDMI capture device from the **Device** menu; the app does not automatically activate an arbitrary webcam. You can select another device or profile from the menus. If enumeration happens before a device is connected, choose **Window → Rescan devices** after connecting it. Close the window to exit.
 
-## License and contributions
+## Known gaps and unverified behavior
 
-A license has not been selected yet. Until one is added, the public repository should **not** be assumed to permit reuse or redistribution of its contents.
+- This Linux worktree has no Windows SDK or MSVC compiler, so the Win32 application has not been compiled or run here. The Windows Actions build is configured but has not run in this offline implementation session.
+- No physical capture device was available for checking enumeration, driver behavior, image orientation/color, sustained FPS, signal changes, unplug/replug, or suspend/resume. The YUY2 path verifies that Source Reader output is YUY2 with converters disabled; advertised modes and RGB32 fallback output do not prove which native subtype is delivered or the sustained rate.
+- The YUY2 path converts to BGRA on the CPU before D3D11 upload, while compressed/other fallback profiles use Media Foundation RGB32 decode/conversion. Both paths copy frames. Device-loss recovery and robust repeated start/stop handling need hardware validation.
+- Device/profile choice and window geometry are not persisted. Fullscreen mode, a diagnostic overlay, and recovery after device/signal loss are not implemented.
+- Callback-to-submit timing is an application-side estimate, not end-to-end latency evidence. No comparison against FFplay or PotPlayer, high-speed-camera measurement, 20-minute stability run, or repeated connect/disconnect test has been performed. Do not infer an input-to-photon latency or sustained 60 fps guarantee from the selected advertised mode.
+- The remaining Issue #1 requirements are future work: validate native-mode selection on hardware; measure and tune capture-to-display latency; test lifecycle recovery and long-run stability; add settings persistence and fullscreen; and complete Windows build/runtime acceptance.
+
+There is no project license yet. Do not assume the code is licensed for reuse or redistribution.
