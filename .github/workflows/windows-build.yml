@@ -1,0 +1,33 @@
+name: Windows x64 build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build native x64 application
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp /Fe:hdmi-capture-viewer.exe mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and run latest-frame tests
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\latest_frame_tests.cpp /Fe:latest_frame_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\latest_frame_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows x64 preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdmi-capture-viewer-windows-x64
+          path: hdmi-capture-viewer.exe
+          if-no-files-found: error
