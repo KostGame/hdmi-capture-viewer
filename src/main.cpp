@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include "latest_frame.hpp"
+#include "resize_gate.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +39,8 @@ using Clock = std::chrono::steady_clock;
 namespace {
 constexpr UINT WM_NEW_FRAME = WM_APP + 1;
 constexpr UINT WM_CAPTURE_STATUS = WM_APP + 2;
+constexpr UINT_PTR LIVE_MOVE_TIMER = 7;
+constexpr UINT LIVE_MOVE_TIMER_PERIOD_MS = 16;
 constexpr UINT DEVICE_COMMAND_BASE = 1000;
 constexpr UINT MODE_COMMAND_BASE = 2000;
 constexpr UINT MAX_MENU_ITEMS = 500;
@@ -164,6 +167,12 @@ struct App {
     Clock::time_point lastTitleUpdate{};
     bool borderless{};
     bool vsyncEnabled{true};
+    bool interactiveMoveResize{};
+    hcv::ResizeGate resizeGate;
+    Clock::time_point lastInteractivePaint{};
+    UINT swapWidth{}, swapHeight{};
+    std::uint64_t resizeCount{}, resizeFailures{}, liveMoveFrames{};
+    HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     DWORD savedStyle{};
     RECT savedClientRect{};
@@ -191,6 +200,8 @@ struct App {
         update_title(true);
     }
     void update_title(bool force = false) {
+        // Caption changes trigger nonclient updates. Avoid them in the move/size modal loop.
+        if (interactiveMoveResize) return;
         const auto now = Clock::now();
         if (!force && lastTitleUpdate.time_since_epoch().count() && now - lastTitleUpdate < std::chrono::seconds(1)) return;
         lastTitleUpdate = now;
@@ -376,6 +387,8 @@ struct App {
         HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
             D3D11_SDK_VERSION, &desc, &swapChain, &d3d, &level, &context);
         if (FAILED(hr)) return false;
+        swapWidth = desc.BufferDesc.Width;
+        swapHeight = desc.BufferDesc.Height;
         const char* shader = "Texture2D videoTexture : register(t0); SamplerState videoSampler : register(s0);"
             "struct V { float2 p : POSITION; float2 uv : TEXCOORD; }; struct P { float4 p : SV_POSITION; float2 uv : TEXCOORD; };"
             "P VS(V i) { P o; o.p=float4(i.p,0,1); o.uv=i.uv; return o; }"
@@ -414,9 +427,53 @@ struct App {
         return true;
     }
 
+    // WM_SIZE only records the newest dimensions. Releasing the render target
+    // and resizing the swap chain at every intermediate mouse position causes
+    // severe stalls and flicker during interactive drag/resize.
+    bool apply_pending_resize(bool force = false) {
+        if (!swapChain) return true;
+        const auto now = Clock::now();
+        if (!resizeGate.ready(now, interactiveMoveResize && !force)) return true;
+        const UINT w = static_cast<UINT>(resizeGate.width());
+        const UINT h = static_cast<UINT>(resizeGate.height());
+        if (w == swapWidth && h == swapHeight) {
+            resizeGate.completed(now);
+            return true;
+        }
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        backBufferView.Reset();
+        context->Flush();
+        const HRESULT hr = swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+        resizeGate.attempted(now);
+        if (FAILED(hr)) {
+            ++resizeFailures;
+            lastResizeError = hr;
+            return false; // Do not draw to a discarded or mismatched buffer.
+        }
+        swapWidth = w;
+        swapHeight = h;
+        ++resizeCount;
+        resizeGate.completed(now);
+        return true;
+    }
+
+    void interactive_tick() {
+        if (!interactiveMoveResize) return;
+        const auto now = Clock::now();
+        if (lastInteractivePaint.time_since_epoch().count() &&
+            now - lastInteractivePaint < std::chrono::milliseconds(15)) return;
+        lastInteractivePaint = now;
+        render(true);
+    }
+
     void render(bool consumeFrame) {
+        if (!window || IsIconic(window)) return;
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
         auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
+        // Timer + posted wakeups may race to process the same frame. Never
+        // present duplicates unless a resize or explicit paint needs it.
+        if (consumeFrame && !frame && !resizeGate.ready(Clock::now(), interactiveMoveResize)) return;
+        if (!apply_pending_resize()) return;
         if (frame) {
             const UINT texWidth = static_cast<UINT>(frame->format == hcv::PixelFormat::Yuy2 ? frame->width / 2 : frame->width);
             const UINT texHeight = static_cast<UINT>(frame->height);
@@ -438,8 +495,9 @@ struct App {
             submitMs = std::chrono::duration<double, std::milli>(Clock::now() - frame->capturedAt).count();
             captureCopyMs = frame->captureCopyMs;
         }
-        RECT rect{}; GetClientRect(window, &rect);
-        const float width = static_cast<float>(rect.right), height = static_cast<float>(rect.bottom);
+        // During a deferred resize, use the dimensions of the *actual*
+        // swap-chain target, not the potentially newer client rectangle.
+        const float width = static_cast<float>(swapWidth), height = static_cast<float>(swapHeight);
         D3D11_VIEWPORT viewport{}; viewport.Width = width; viewport.Height = height; viewport.MaxDepth = 1;
         context->RSSetViewports(1, &viewport);
         if (!backBufferView) {
@@ -461,10 +519,13 @@ struct App {
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
             }
             const auto presentStart = Clock::now();
-            swapChain->Present(vsyncEnabled ? 1u : 0u, 0);
+            // Waiting for VSync inside Windows' modal drag loop stalls mouse
+            // tracking. Keep the user's VSync preference for normal playback.
+            swapChain->Present(interactiveMoveResize ? 0u : (vsyncEnabled ? 1u : 0u), 0);
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
         }
         if (frame) {
+            if (interactiveMoveResize) ++liveMoveFrames;
             ++presentedFrames;
             const auto now = Clock::now();
             const auto elapsed = std::chrono::duration<double>(now - fpsWindow).count();
@@ -476,7 +537,11 @@ struct App {
                 L"; GPU YUY2 " + (gpuYuy2Active ? L"active" : L"inactive") + L"; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
                 std::to_wstring(static_cast<int>(captureCopyMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
                 std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
-                (vsyncEnabled ? L"on" : L"off") + L" (app metrics; NOT input-to-photon)";
+                (vsyncEnabled ? L"on" : L"off") + L"; resize " +
+                std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
+                L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
+                L"; live frames " + std::to_wstring(liveMoveFrames) +
+                L" (app metrics; NOT input-to-photon)";
             update_title();
         }
     }
@@ -542,15 +607,47 @@ App* app = nullptr;
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
-    case WM_PAINT: { PAINTSTRUCT ps{}; BeginPaint(hwnd, &ps); app->paint(); EndPaint(hwnd, &ps); return 0; }
-    case WM_SIZE: if (app->swapChain && wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
-        app->context->OMSetRenderTargets(0, nullptr, nullptr);
-        app->backBufferView.Reset();
-        app->swapChain->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
-    } InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    case WM_ERASEBKGND: return 1; // D3D paints the whole client: prevent white/gray flashes.
+    case WM_ENTERSIZEMOVE:
+        app->interactiveMoveResize = true;
+        app->lastInteractivePaint = {};
+        SetTimer(hwnd, LIVE_MOVE_TIMER, LIVE_MOVE_TIMER_PERIOD_MS, nullptr);
+        return 0;
+    case WM_EXITSIZEMOVE:
+        KillTimer(hwnd, LIVE_MOVE_TIMER);
+        app->interactiveMoveResize = false;
+        app->render(true); // Apply the exact final size immediately.
+        app->update_title(true);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_MOVING:
+    case WM_SIZING:
+        app->interactive_tick(); // Synchronous progress even if posted frame messages stall.
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    case WM_TIMER:
+        if (wParam == LIVE_MOVE_TIMER) {
+            app->interactive_tick();
+            return 0;
+        }
+        break;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        BeginPaint(hwnd, &ps);
+        if (app->interactiveMoveResize) app->interactive_tick();
+        else app->paint();
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
+            app->resizeGate.request(LOWORD(lParam), HIWORD(lParam));
+            if (!app->interactiveMoveResize) InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
     case WM_NEW_FRAME:
         app->frameWakeQueued.store(false, std::memory_order_release);
-        app->render(true);
+        if (app->interactiveMoveResize) app->interactive_tick();
+        else app->render(true);
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11 && app->borderless) { app->toggle_borderless(); return 0; }
@@ -597,7 +694,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         break;
     }
-    case WM_DESTROY: app->stop_capture(); PostQuitMessage(0); return 0;
+    case WM_DESTROY: KillTimer(hwnd, LIVE_MOVE_TIMER); app->stop_capture(); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }

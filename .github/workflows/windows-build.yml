@@ -18,6 +18,11 @@ jobs:
         run: |
           python tests/test_capture_reader_init.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify interactive window resize contract
+        shell: pwsh
+        run: |
+          python tests/test_live_resize_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native x64 application
         shell: pwsh
         run: |
@@ -38,6 +43,10 @@ jobs:
           cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\latest_frame_tests.cpp /Fe:latest_frame_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\latest_frame_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\resize_gate_tests.cpp /Fe:resize_gate_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\resize_gate_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload Windows x64 preview
         uses: actions/upload-artifact@v4
