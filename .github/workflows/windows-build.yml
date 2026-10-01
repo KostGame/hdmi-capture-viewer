@@ -13,6 +13,11 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Verify Media Foundation reader setup
+        shell: pwsh
+        run: |
+          python tests/test_capture_reader_init.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native x64 application
         shell: pwsh
         run: |

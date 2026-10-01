@@ -241,6 +241,10 @@ struct App {
             if (SUCCEEDED(hr) && count == 0) hr = MF_E_NOT_FOUND;
             if (SUCCEEDED(hr)) hr = list[0]->ActivateObject(IID_PPV_ARGS(&source));
             if (list) { for (UINT32 i = 0; i < count; ++i) list[i]->Release(); CoTaskMemFree(list); }
+            // Do not proceed with output negotiation until the reader exists.
+            if (SUCCEEDED(hr) && !source) hr = E_POINTER;
+            if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), attrs.Get(), &reader);
+            if (SUCCEEDED(hr) && !reader) hr = E_POINTER;
             ComPtr<IMFMediaType> output;
             if (SUCCEEDED(hr)) hr = MFCreateMediaType(&output);
             if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
