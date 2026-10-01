@@ -48,6 +48,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\resize_gate_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\window_geometry_tests.cpp /Fe:window_geometry_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\window_geometry_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload Windows x64 preview
         uses: actions/upload-artifact@v4
         with:

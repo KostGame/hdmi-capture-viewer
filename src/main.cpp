@@ -11,6 +11,7 @@
 
 #include "latest_frame.hpp"
 #include "resize_gate.hpp"
+#include "window_geometry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -548,6 +549,52 @@ struct App {
 
     void paint() { render(false); }
 
+    void fit_window_to_video_aspect() {
+        if (!window) return;
+        if (IsZoomed(window)) ShowWindow(window, SW_RESTORE);
+
+        RECT client{}, outer{};
+        if (!GetClientRect(window, &client) || !GetWindowRect(window, &outer)) return;
+        const int clientW = client.right - client.left;
+        const int clientH = client.bottom - client.top;
+
+        int videoW = static_cast<int>(displayWidth);
+        int videoH = static_cast<int>(textureHeight);
+        if ((videoW <= 0 || videoH <= 0) && selectedDevice < devices.size() &&
+            selectedMode < devices[selectedDevice].modes.size()) {
+            const auto& mode = devices[selectedDevice].modes[selectedMode];
+            videoW = static_cast<int>(mode.width);
+            videoH = static_cast<int>(mode.height);
+        }
+        if (videoW <= 0 || videoH <= 0) return;
+
+        const auto target = hcv::fit_inside_aspect(clientW, clientH, videoW, videoH);
+        if (target.width == clientW && target.height == clientH) return;
+
+        const int nonClientW = (outer.right - outer.left) - clientW;
+        const int nonClientH = (outer.bottom - outer.top) - clientH;
+        const int newOuterW = target.width + nonClientW;
+        const int newOuterH = target.height + nonClientH;
+
+        MONITORINFO mi{sizeof(mi)};
+        if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        const RECT work = mi.rcWork;
+        constexpr int edgeSnapTolerance = 40;
+        auto near_edge = [&](int a, int b) { return std::abs(a - b) <= edgeSnapTolerance; };
+
+        int x = outer.left;
+        int y = outer.top;
+        if (near_edge(outer.right, work.right)) x = work.right - newOuterW;
+        else if (near_edge(outer.left, work.left)) x = work.left;
+        if (near_edge(outer.bottom, work.bottom)) y = work.bottom - newOuterH;
+        else if (near_edge(outer.top, work.top)) y = work.top;
+
+        x = std::clamp(x, work.left, std::max(work.left, work.right - newOuterW));
+        y = std::clamp(y, work.top, std::max(work.top, work.bottom - newOuterH));
+        SetWindowPos(window, nullptr, x, y, newOuterW, newOuterH,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     void rebuild_menus() {
         HMENU previous = GetMenu(window);
         if (borderless) {
@@ -571,6 +618,7 @@ struct App {
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
+        AppendMenuW(windowMenu, MF_STRING, 3005, L"Fit video aspect (F9)");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
@@ -651,6 +699,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11 && app->borderless) { app->toggle_borderless(); return 0; }
+        if (wParam == VK_F9) { app->fit_window_to_video_aspect(); return 0; }
         if (wParam == VK_F2) {
             std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
@@ -683,6 +732,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
+        if (id == 3005) { app->fit_window_to_video_aspect(); return 0; }
         if (id == 3002) {
             app->stop_capture(); app->devices = enumerate_devices(); app->selectedDevice = 0;
             app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[0]);
