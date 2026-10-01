@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -12,6 +13,7 @@
 #include "latest_frame.hpp"
 #include "resize_gate.hpp"
 #include "window_geometry.hpp"
+#include "viewport_math.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -167,6 +169,11 @@ struct App {
     std::mutex captureMetricsMutex;
     Clock::time_point lastTitleUpdate{};
     bool borderless{};
+    hcv::ViewMode viewMode{hcv::ViewMode::Fit};
+    float panX{}, panY{};
+    bool spacePanning{}, draggingPan{};
+    POINT dragOrigin{};
+    float dragPanX{}, dragPanY{};
     bool vsyncEnabled{true};
     bool interactiveMoveResize{};
     hcv::ResizeGate resizeGate;
@@ -177,12 +184,17 @@ struct App {
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     DWORD savedStyle{};
     RECT savedClientRect{};
+    HMENU savedMenu{};
+    hcv::ViewMode savedViewMode{hcv::ViewMode::Fit};
+    float savedPanX{}, savedPanY{};
 
     ComPtr<ID3D11Device> d3d;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IDXGISwapChain> swapChain;
     ComPtr<ID3D11VertexShader> vertexShader;
     ComPtr<ID3D11PixelShader> pixelShader;
+    ComPtr<ID3D11PixelShader> overlayShader;
+    ComPtr<ID3D11BlendState> overlayBlend;
     ComPtr<ID3D11InputLayout> inputLayout;
     ComPtr<ID3D11Buffer> vertexBuffer;
     ComPtr<ID3D11SamplerState> sampler;
@@ -399,6 +411,20 @@ struct App {
         if (FAILED(hr)) return false;
         hr = D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &ps, &errors);
         if (FAILED(hr)) return false;
+        const char* overlay = "float4 PS() : SV_TARGET { return float4(0.72,0.78,0.84,0.72); }";
+        ComPtr<ID3DBlob> overlayPs;
+        hr = D3DCompile(overlay, strlen(overlay), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &overlayPs, &errors);
+        if (FAILED(hr) || FAILED(d3d->CreatePixelShader(overlayPs->GetBufferPointer(), overlayPs->GetBufferSize(), nullptr, &overlayShader))) return false;
+        D3D11_BLEND_DESC blend{};
+        blend.RenderTarget[0].BlendEnable = TRUE;
+        blend.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        blend.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(d3d->CreateBlendState(&blend, &overlayBlend))) return false;
         const char* yuy2Shader =
             "Texture2D packedTexture : register(t0);"
             "struct P { float4 p : SV_POSITION; float2 uv : TEXCOORD; };"
@@ -423,10 +449,8 @@ struct App {
             {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0}
         };
         if (FAILED(d3d->CreateInputLayout(elements, 2, vs->GetBufferPointer(), vs->GetBufferSize(), &inputLayout))) return false;
-        const Vertex vertices[] = {{-1,1,0,0},{1,1,1,0},{-1,-1,0,1},{1,-1,1,1}};
-        D3D11_BUFFER_DESC vb{}; vb.ByteWidth = sizeof(vertices); vb.Usage = D3D11_USAGE_IMMUTABLE; vb.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        D3D11_SUBRESOURCE_DATA initial{}; initial.pSysMem = vertices;
-        if (FAILED(d3d->CreateBuffer(&vb, &initial, &vertexBuffer))) return false;
+        D3D11_BUFFER_DESC vb{}; vb.ByteWidth = sizeof(Vertex)*4; vb.Usage = D3D11_USAGE_DYNAMIC; vb.BindFlags = D3D11_BIND_VERTEX_BUFFER; vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(d3d->CreateBuffer(&vb, nullptr, &vertexBuffer))) return false;
         D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
         if (FAILED(d3d->CreateSamplerState(&sd, &sampler))) return false;
         return true;
@@ -503,6 +527,10 @@ struct App {
         // During a deferred resize, use the dimensions of the *actual*
         // swap-chain target, not the potentially newer client rectangle.
         const float width = static_cast<float>(swapWidth), height = static_cast<float>(swapHeight);
+        if(viewMode==hcv::ViewMode::Pixel100 && displayWidth){
+            panX=hcv::clamp_pan(panX,static_cast<int>(displayWidth),static_cast<int>(width));
+            panY=hcv::clamp_pan(panY,static_cast<int>(textureHeight),static_cast<int>(height));
+        }
         D3D11_VIEWPORT viewport{}; viewport.Width = width; viewport.Height = height; viewport.MaxDepth = 1;
         context->RSSetViewports(1, &viewport);
         if (!backBufferView) {
@@ -511,17 +539,37 @@ struct App {
         }
         if (backBufferView) {
             const float black[] = {0,0,0,1}; ID3D11RenderTargetView* target = backBufferView.Get(); context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(backBufferView.Get(), black);
-            if (videoView && textureWidth && textureHeight && width > 0 && height > 0) {
-                const float scale = std::min(width / displayWidth, height / textureHeight);
-                D3D11_VIEWPORT image{}; image.Width = displayWidth * scale; image.Height = textureHeight * scale;
-                image.TopLeftX = (width - image.Width) * 0.5f; image.TopLeftY = (height - image.Height) * 0.5f; image.MaxDepth = 1;
-                context->RSSetViewports(1, &image);
+            if (videoView && textureWidth && textureHeight && width > 0 && height > 0 && displayWidth) {
+                const auto layout=hcv::calculate_view(viewMode,static_cast<int>(width),static_cast<int>(height),static_cast<int>(displayWidth),static_cast<int>(textureHeight),panX,panY);
+                const auto& d=layout.destination; const auto& s=layout.source;
+                const float l=2*d.x/width-1, r=2*(d.x+d.width)/width-1, t=1-2*d.y/height, b=1-2*(d.y+d.height)/height;
+                const Vertex vertices[]={{l,t,s.x/displayWidth,s.y/textureHeight},{r,t,(s.x+s.width)/displayWidth,s.y/textureHeight},{l,b,s.x/displayWidth,(s.y+s.height)/textureHeight},{r,b,(s.x+s.width)/displayWidth,(s.y+s.height)/textureHeight}};
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                if (SUCCEEDED(context->Map(vertexBuffer.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped))) { std::memcpy(mapped.pData,vertices,sizeof(vertices)); context->Unmap(vertexBuffer.Get(),0); }
+                D3D11_VIEWPORT image{}; image.Width=width; image.Height=height; image.MaxDepth=1;
+                context->RSSetViewports(1,&image);
                 UINT stride = sizeof(Vertex), offset = 0; ID3D11Buffer* vb = vertexBuffer.Get();
                 context->IASetInputLayout(inputLayout.Get()); context->IASetVertexBuffers(0, 1, &vb, &stride, &offset); context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
                 context->VSSetShader(vertexShader.Get(), nullptr, 0); context->PSSetShader(gpuYuy2Active ? yuy2PixelShader.Get() : pixelShader.Get(), nullptr, 0);
                 ID3D11ShaderResourceView* view = videoView.Get(); ID3D11SamplerState* smp = sampler.Get();
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
+                if(viewMode==hcv::ViewMode::Pixel100){
+                    const float blendFactor[4]{};
+                    context->OMSetBlendState(overlayBlend.Get(), blendFactor, 0xffffffffu);
+                    context->PSSetShader(overlayShader.Get(),nullptr,0);
+                    auto thumb=[&](float x,float y,float w,float h){
+                        const float a=2*x/width-1,bx=2*(x+w)/width-1,ay=1-2*y/height,by=1-2*(y+h)/height;
+                        const Vertex q[]={{a,ay,0,0},{bx,ay,0,0},{a,by,0,0},{bx,by,0,0}};
+                        D3D11_MAPPED_SUBRESOURCE m{};if(SUCCEEDED(context->Map(vertexBuffer.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&m))){std::memcpy(m.pData,q,sizeof(q));context->Unmap(vertexBuffer.Get(),0);context->Draw(4,0);}
+                    };
+                    constexpr float thickness=5;
+                    const auto sx=hcv::scrollbar_thumb(static_cast<int>(width),static_cast<int>(displayWidth),panX,static_cast<int>(width)-8);
+                    const auto sy=hcv::scrollbar_thumb(static_cast<int>(height),static_cast<int>(textureHeight),panY,static_cast<int>(height)-8);
+                    if(sx.needed)thumb(4.0f+static_cast<float>(sx.start),height-thickness-2,static_cast<float>(sx.length),thickness);
+                    if(sy.needed)thumb(width-thickness-2,4.0f+static_cast<float>(sy.start),thickness,static_cast<float>(sy.length));
+                    context->OMSetBlendState(nullptr, blendFactor, 0xffffffffu);
+                }
             }
             const auto presentStart = Clock::now();
             // Waiting for VSync inside Windows' modal drag loop stalls mouse
@@ -537,7 +585,7 @@ struct App {
             if (elapsed >= 1.0) { renderFps = presentedFrames / elapsed; presentedFrames = 0; fpsWindow = now; }
             double measuredCaptureFps, measuredCaptureP95;
             { std::lock_guard lock(captureMetricsMutex); measuredCaptureFps = captureFps; measuredCaptureP95 = captureP95Ms; }
-            diagnostic = L"capture " + std::to_wstring(static_cast<int>(std::lround(measuredCaptureFps))) + L" fps; render " +
+        diagnostic = L"capture " + std::to_wstring(static_cast<int>(std::lround(measuredCaptureFps))) + L" fps; render " +
                 std::to_wstring(static_cast<int>(std::lround(renderFps))) + L" fps; replaced " + std::to_wstring(pending.replaced()) +
                 L"; GPU YUY2 " + (gpuYuy2Active ? L"active" : L"inactive") + L"; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
                 std::to_wstring(static_cast<int>(captureCopyMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
@@ -545,7 +593,7 @@ struct App {
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
-                L"; live frames " + std::to_wstring(liveMoveFrames) +
+                L"; view " + (viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; live frames " + std::to_wstring(liveMoveFrames) +
                 L" (app metrics; NOT input-to-photon)";
             update_title();
         }
@@ -591,6 +639,8 @@ struct App {
         if (!window) return;
         int videoW{}, videoH{};
         if (!video_dimensions(videoW, videoH)) return;
+        viewMode=hcv::ViewMode::Pixel100; panX=panY=0;
+        if (borderless) { render(false); return; }
         if (IsZoomed(window)) ShowWindow(window, SW_RESTORE);
 
         RECT outer{};
@@ -654,12 +704,13 @@ struct App {
                 AppendMenuW(formatMenu, MF_STRING | (i == selectedMode ? MF_CHECKED : 0), MODE_COMMAND_BASE + static_cast<UINT>(i), label.c_str());
             }
         }
-        AppendMenuW(windowMenu, MF_STRING | (borderless ? MF_CHECKED : 0), 3001, L"Borderless window");
+        AppendMenuW(windowMenu, MF_STRING | (borderless ? MF_CHECKED : 0), 3001, L"Borderless window (F11)");
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
-        AppendMenuW(windowMenu, MF_STRING, 3005, L"Video size 100% / source pixels (F9)");
-        AppendMenuW(windowMenu, MF_STRING, 3006, L"Fit video aspect inside current window");
+        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Pixel100?MF_CHECKED:0), 3005, L"100% / Pixel (F9)");
+        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fit?MF_CHECKED:0), 3006, L"Fit (F10)");
+        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fill?MF_CHECKED:0), 3008, L"Fill");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
@@ -670,22 +721,25 @@ struct App {
 
     void toggle_borderless() {
         if (!borderless) {
-            HMENU menu = GetMenu(window);
+            savedMenu = GetMenu(window);
             SetMenu(window, nullptr);
-            if (menu) DestroyMenu(menu);
             savedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
             savedPlacement.length = sizeof(savedPlacement); GetWindowPlacement(window, &savedPlacement);
-            GetClientRect(window, &savedClientRect);
-            MapWindowPoints(window, HWND_DESKTOP, reinterpret_cast<POINT*>(&savedClientRect), 2);
-            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-            SetWindowPos(window, HWND_TOP, savedClientRect.left, savedClientRect.top,
-                savedClientRect.right - savedClientRect.left, savedClientRect.bottom - savedClientRect.top, SWP_FRAMECHANGED);
+            GetWindowRect(window, &savedClientRect);
+            savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
+            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
+            MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&mi);
+            SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                mi.rcMonitor.right-mi.rcMonitor.left,mi.rcMonitor.bottom-mi.rcMonitor.top,SWP_FRAMECHANGED);
+            viewMode=hcv::ViewMode::Fill;
             borderless = true;
         } else {
             SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
             SetWindowPlacement(window, &savedPlacement);
+            SetMenu(window,savedMenu);
             SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
             borderless = false;
+            viewMode=savedViewMode; panX=savedPanX; panY=savedPanY; savedMenu=nullptr;
         }
         rebuild_menus();
     }
@@ -696,6 +750,9 @@ App* app = nullptr;
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
+    case WM_NCCALCSIZE:
+        if(app->borderless) return 0; // Keep the sizing frame entirely inside the client area.
+        break;
     case WM_ERASEBKGND: return 1; // D3D paints the whole client: prevent white/gray flashes.
     case WM_ENTERSIZEMOVE:
         app->interactiveMoveResize = true;
@@ -733,14 +790,50 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             if (!app->interactiveMoveResize) InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
+    case WM_NCHITTEST:
+        if(app->borderless){
+            POINT p{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&p);RECT c{};GetClientRect(hwnd,&c);
+            const int edge=std::max(1,static_cast<int>(std::lround(8.0*GetDpiForWindow(hwnd)/96.0)));
+            const int caption=std::max(edge,static_cast<int>(std::lround(24.0*GetDpiForWindow(hwnd)/96.0)));
+            switch(hcv::borderless_hit_test(p.x,p.y,c.right,c.bottom,edge,caption)){
+            case hcv::ResizeEdge::Left:return HTLEFT; case hcv::ResizeEdge::Right:return HTRIGHT;
+            case hcv::ResizeEdge::Top:return HTTOP; case hcv::ResizeEdge::Bottom:return HTBOTTOM;
+            case hcv::ResizeEdge::TopLeft:return HTTOPLEFT; case hcv::ResizeEdge::TopRight:return HTTOPRIGHT;
+            case hcv::ResizeEdge::BottomLeft:return HTBOTTOMLEFT; case hcv::ResizeEdge::BottomRight:return HTBOTTOMRIGHT;
+            case hcv::ResizeEdge::Caption:return HTCAPTION; default:break;
+            }
+        }
+        return DefWindowProcW(hwnd,message,wParam,lParam);
+    case WM_MOUSEWHEEL:
+        if(app->viewMode==hcv::ViewMode::Pixel100){
+            RECT c{};GetClientRect(hwnd,&c);const int delta=GET_WHEEL_DELTA_WPARAM(wParam)/WHEEL_DELTA*60*(GET_KEYSTATE_WPARAM(wParam)&MK_SHIFT?-1:1);
+            if(GET_KEYSTATE_WPARAM(wParam)&MK_SHIFT)app->panX=hcv::clamp_pan(app->panX-delta,static_cast<int>(app->displayWidth),c.right);
+            else app->panY=hcv::clamp_pan(app->panY-delta,static_cast<int>(app->textureHeight),c.bottom);
+            app->render(false);return 0;
+        }
+        break;
+    case WM_KEYUP:
+        if(wParam==VK_SPACE)app->spacePanning=false;
+        return 0;
+    case WM_LBUTTONDOWN:
+        if(app->viewMode==hcv::ViewMode::Pixel100&&app->spacePanning){app->draggingPan=true;app->dragOrigin={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};app->dragPanX=app->panX;app->dragPanY=app->panY;SetCapture(hwnd);return 0;}
+        break;
+    case WM_MOUSEMOVE:
+        if(app->draggingPan){RECT c{};GetClientRect(hwnd,&c);app->panX=hcv::clamp_pan(app->dragPanX-(GET_X_LPARAM(lParam)-app->dragOrigin.x),static_cast<int>(app->displayWidth),c.right);app->panY=hcv::clamp_pan(app->dragPanY-(GET_Y_LPARAM(lParam)-app->dragOrigin.y),static_cast<int>(app->textureHeight),c.bottom);app->render(false);return 0;}
+        break;
+    case WM_LBUTTONUP:
+        if(app->draggingPan){app->draggingPan=false;ReleaseCapture();return 0;}
+        break;
     case WM_NEW_FRAME:
         app->frameWakeQueued.store(false, std::memory_order_release);
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->render(true);
         return 0;
     case WM_KEYDOWN:
-        if (wParam == VK_F11 && app->borderless) { app->toggle_borderless(); return 0; }
+        if (wParam == VK_SPACE) {app->spacePanning=true;return 0;}
+        if (wParam == VK_F11) { app->toggle_borderless(); return 0; }
         if (wParam == VK_F9) { app->set_video_pixels_100_percent(); return 0; }
+        if (wParam == VK_F10) { app->viewMode=(GetKeyState(VK_CONTROL)&0x8000)?hcv::ViewMode::Fill:hcv::ViewMode::Fit;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
         if (wParam == VK_F2) {
             std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
@@ -774,7 +867,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (id == 3005) { app->set_video_pixels_100_percent(); return 0; }
-        if (id == 3006) { app->fit_window_to_video_aspect(); return 0; }
+        if (id == 3006) { app->viewMode=hcv::ViewMode::Fit;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
+        if (id == 3008) { app->viewMode=hcv::ViewMode::Fill;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
         if (id == 3002) {
             app->stop_capture(); app->devices = enumerate_devices(); app->selectedDevice = 0;
             app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[0]);
