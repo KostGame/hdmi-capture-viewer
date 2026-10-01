@@ -4,6 +4,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <mfobjects.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -68,27 +69,6 @@ std::wstring subtype_name(REFGUID id) {
     if (IsEqualGUID(id, MFVideoFormat_RGB32)) return L"RGB32";
     if (IsEqualGUID(id, MFVideoFormat_UYVY)) return L"UYVY";
     return L"other";
-}
-
-std::uint8_t clamp_byte(int value) { return static_cast<std::uint8_t>(std::clamp(value, 0, 255)); }
-
-void yuy2_to_bgra(const BYTE* source, UINT32 width, UINT32 height, std::vector<std::uint8_t>& dest) {
-    dest.resize(static_cast<std::size_t>(width) * height * 4);
-    for (UINT32 y = 0; y < height; ++y) {
-        const BYTE* row = source + static_cast<std::size_t>(y) * width * 2;
-        for (UINT32 x = 0; x < width; x += 2) {
-            const int y0 = row[x * 2 + 0], u = row[x * 2 + 1] - 128;
-            const int y1 = row[x * 2 + 2], v = row[x * 2 + 3] - 128;
-            for (UINT32 pair = 0; pair < 2 && x + pair < width; ++pair) {
-                const int c = std::max(0, static_cast<int>(pair ? y1 : y0) - 16);
-                const auto offset = (static_cast<std::size_t>(y) * width + x + pair) * 4;
-                dest[offset + 0] = clamp_byte((298 * c + 516 * u + 128) >> 8);
-                dest[offset + 1] = clamp_byte((298 * c - 100 * u - 208 * v + 128) >> 8);
-                dest[offset + 2] = clamp_byte((298 * c + 409 * v + 128) >> 8);
-                dest[offset + 3] = 255;
-            }
-        }
-    }
 }
 
 std::vector<Device> enumerate_devices() {
@@ -172,7 +152,7 @@ struct App {
     Clock::time_point fpsWindow = Clock::now();
     double renderFps{};
     double submitMs{};
-    double conversionMs{};
+    double captureCopyMs{};
     double captureFps{};
     double captureP95Ms{};
     double presentMs{};
@@ -201,6 +181,10 @@ struct App {
     ComPtr<ID3D11ShaderResourceView> videoView;
     UINT textureWidth{};
     UINT textureHeight{};
+    UINT displayWidth{};
+    hcv::PixelFormat textureFormat{hcv::PixelFormat::Bgra32};
+    ComPtr<ID3D11PixelShader> yuy2PixelShader;
+    bool gpuYuy2Active{};
 
     void set_status(std::wstring value) {
         captureStatus = std::move(value);
@@ -257,7 +241,6 @@ struct App {
             if (SUCCEEDED(hr) && count == 0) hr = MF_E_NOT_FOUND;
             if (SUCCEEDED(hr)) hr = list[0]->ActivateObject(IID_PPV_ARGS(&source));
             if (list) { for (UINT32 i = 0; i < count; ++i) list[i]->Release(); CoTaskMemFree(list); }
-            if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), attrs.Get(), &reader);
             ComPtr<IMFMediaType> output;
             if (SUCCEEDED(hr)) hr = MFCreateMediaType(&output);
             if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -277,14 +260,23 @@ struct App {
             }
             ComPtr<IMFMediaType> negotiated;
             GUID negotiatedSubtype{};
-            if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &negotiated)))
+            LONG negotiatedStride = 0;
+            if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &negotiated))) {
                 negotiated->GetGUID(MF_MT_SUBTYPE, &negotiatedSubtype);
+                UINT32 stride = 0;
+                if (SUCCEEDED(negotiated->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride))) negotiatedStride = static_cast<LONG>(stride);
+            }
+            if (directYuy2 && (!IsEqualGUID(negotiatedSubtype, MFVideoFormat_YUY2) || (mode.width & 1))) {
+                auto* error = new std::wstring(L"YUY2 GPU path requires negotiated YUY2 output and even frame width; choose another listed format.");
+                if (!PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(error))) delete error;
+                reader.Reset(); source->Shutdown(); return;
+            }
             auto* message = new std::wstring(L"Capturing " + device.name + L"; selected advertised " + subtype_name(mode.subtype) +
                 L" " + std::to_wstring(mode.width) + L"x" + std::to_wstring(mode.height) + L" @ " +
                 std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L"; Source Reader output " + subtype_name(negotiatedSubtype) +
-                (directYuy2 ? L" (converters disabled)" : L" (decoded/converted; native input subtype not confirmed"));
+                (directYuy2 ? L" (converters disabled; GPU YUY2 selected)" : L" (decoded/converted; native input subtype not confirmed"));
             if (!directYuy2) *message += L")";
-            PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(message));
+            if (!PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(message))) delete message;
             while (!stopCapture) {
                 DWORD stream = 0, flags = 0;
                 LONGLONG timestamp = 0;
@@ -303,10 +295,23 @@ struct App {
                 BYTE* data = nullptr;
                 DWORD maxLength = 0, length = 0;
                 if (FAILED(buffer->Lock(&data, &maxLength, &length))) continue;
-                const std::size_t bytesPerPixel = directYuy2 ? 2 : 4;
-                const std::size_t rowBytes = static_cast<std::size_t>(mode.width) * bytesPerPixel;
+                const std::size_t bytesPerPixel = 4;
+                const std::size_t rowBytes = static_cast<std::size_t>(mode.width) * (directYuy2 ? 2u : bytesPerPixel);
+                std::size_t yuy2Bytes = 0;
+                const bool validYuy2Size = hcv::packed_yuy2_size(static_cast<int>(mode.width), static_cast<int>(mode.height), yuy2Bytes);
+                const LONG pitch = negotiatedStride ? negotiatedStride : static_cast<LONG>(rowBytes);
+                const std::size_t sourcePitch = pitch > 0 ? static_cast<std::size_t>(pitch) : 0;
                 const std::size_t frameBytes = rowBytes * mode.height;
-                if (length >= frameBytes) {
+                const bool layoutValid = pitch > 0 && sourcePitch >= rowBytes &&
+                    sourcePitch <= (static_cast<std::size_t>(-1) - rowBytes) / mode.height &&
+                    sourcePitch * (mode.height - 1) + rowBytes <= length;
+                if ((!directYuy2 || validYuy2Size) && !layoutValid) {
+                    buffer->Unlock();
+                    auto* error = new std::wstring(L"Capture buffer stride or length is unsupported; refusing unsafe frame copy.");
+                    if (!PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(error))) delete error;
+                    break;
+                }
+                if ((!directYuy2 || validYuy2Size) && layoutValid) {
                     {
                         std::lock_guard lock(captureMetricsMutex);
                         if (previousCapture.time_since_epoch().count()) captureIntervals.push_back(std::chrono::duration<double, std::milli>(sampleReadyAt - previousCapture).count());
@@ -331,9 +336,12 @@ struct App {
                     frame.sequence = ++nextSequence;
                     frame.capturedAt = sampleReadyAt;
                     const auto conversionStart = Clock::now();
-                    if (directYuy2) yuy2_to_bgra(data, mode.width, mode.height, frame.bgra);
-                    else frame.bgra.assign(data, data + frameBytes);
-                    frame.conversionMs = std::chrono::duration<double, std::milli>(Clock::now() - conversionStart).count();
+                    frame.format = directYuy2 ? hcv::PixelFormat::Yuy2 : hcv::PixelFormat::Bgra32;
+                    frame.pixels.resize(frameBytes);
+                    for (UINT32 y = 0; y < mode.height; ++y)
+                        std::memcpy(frame.pixels.data() + static_cast<std::size_t>(y) * rowBytes,
+                            data + static_cast<std::size_t>(y) * sourcePitch, rowBytes);
+                    frame.captureCopyMs = std::chrono::duration<double, std::milli>(Clock::now() - conversionStart).count();
                     pending.publish(std::move(frame));
                     // Keep the Win32 message queue bounded as well as the frame mailbox.
                     if (!frameWakeQueued.exchange(true, std::memory_order_acq_rel)) {
@@ -373,6 +381,19 @@ struct App {
         if (FAILED(hr)) return false;
         hr = D3DCompile(shader, strlen(shader), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &ps, &errors);
         if (FAILED(hr)) return false;
+        const char* yuy2Shader =
+            "Texture2D packedTexture : register(t0);"
+            "struct P { float4 p : SV_POSITION; float2 uv : TEXCOORD; };"
+            "float4 PS(P i) : SV_TARGET { uint tw,th; packedTexture.GetDimensions(tw,th);"
+            "uint ow=tw*2, oh=th; uint x=min((uint)(saturate(i.uv.x)*ow),ow-1);"
+            "uint y=min((uint)(saturate(i.uv.y)*oh),oh-1); float4 p=packedTexture.Load(int3(x/2,y,0));"
+            "float yy=((x&1)==0?p.r:p.b)*255.0, u=p.g*255.0-128.0, v=p.a*255.0-128.0;"
+            "float c=max(0.0,yy-16.0); float3 rgb=saturate(float3(floor((298*c+409*v+128)/256.0)/255.0,"
+            "floor((298*c-100*u-208*v+128)/256.0)/255.0,floor((298*c+516*u+128)/256.0)/255.0));"
+            "return float4(rgb,1.0); }";
+        ComPtr<ID3DBlob> yuy2Ps;
+        hr = D3DCompile(yuy2Shader, strlen(yuy2Shader), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &yuy2Ps, &errors);
+        if (FAILED(hr) || FAILED(d3d->CreatePixelShader(yuy2Ps->GetBufferPointer(), yuy2Ps->GetBufferSize(), nullptr, &yuy2PixelShader))) return false;
         if (FAILED(d3d->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vertexShader)) ||
             FAILED(d3d->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &pixelShader))) return false;
         D3D11_INPUT_ELEMENT_DESC elements[] = {
@@ -393,16 +414,25 @@ struct App {
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
         auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
         if (frame) {
-            if (textureWidth != static_cast<UINT>(frame->width) || textureHeight != static_cast<UINT>(frame->height)) {
+            const UINT texWidth = static_cast<UINT>(frame->format == hcv::PixelFormat::Yuy2 ? frame->width / 2 : frame->width);
+            const UINT texHeight = static_cast<UINT>(frame->height);
+            if (textureWidth != texWidth || textureHeight != texHeight || textureFormat != frame->format) {
                 videoView.Reset(); videoTexture.Reset();
-                D3D11_TEXTURE2D_DESC td{}; td.Width = frame->width; td.Height = frame->height; td.MipLevels = td.ArraySize = 1;
-                td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                D3D11_TEXTURE2D_DESC td{}; td.Width = texWidth; td.Height = texHeight; td.MipLevels = td.ArraySize = 1;
+                td.Format = frame->format == hcv::PixelFormat::Yuy2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+                td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                 if (FAILED(d3d->CreateTexture2D(&td, nullptr, &videoTexture)) || FAILED(d3d->CreateShaderResourceView(videoTexture.Get(), nullptr, &videoView))) return;
-                textureWidth = frame->width; textureHeight = frame->height;
+                textureWidth = texWidth; textureHeight = texHeight; textureFormat = frame->format;
             }
-            context->UpdateSubresource(videoTexture.Get(), 0, nullptr, frame->bgra.data(), frame->width * 4, 0);
+            const std::size_t expected = static_cast<std::size_t>(frame->width) * frame->height * (frame->format == hcv::PixelFormat::Yuy2 ? 2 : 4);
+            if (frame->pixels.size() != expected || (frame->format == hcv::PixelFormat::Yuy2 && (frame->width & 1))) {
+                set_status(L"Invalid frame byte size or dimensions; frame rejected."); return;
+            }
+            context->UpdateSubresource(videoTexture.Get(), 0, nullptr, frame->pixels.data(), texWidth * 4, 0);
+            displayWidth = static_cast<UINT>(frame->width);
+            gpuYuy2Active = frame->format == hcv::PixelFormat::Yuy2;
             submitMs = std::chrono::duration<double, std::milli>(Clock::now() - frame->capturedAt).count();
-            conversionMs = frame->conversionMs;
+            captureCopyMs = frame->captureCopyMs;
         }
         RECT rect{}; GetClientRect(window, &rect);
         const float width = static_cast<float>(rect.right), height = static_cast<float>(rect.bottom);
@@ -415,13 +445,13 @@ struct App {
         if (backBufferView) {
             const float black[] = {0,0,0,1}; ID3D11RenderTargetView* target = backBufferView.Get(); context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(backBufferView.Get(), black);
             if (videoView && textureWidth && textureHeight && width > 0 && height > 0) {
-                const float scale = std::min(width / textureWidth, height / textureHeight);
-                D3D11_VIEWPORT image{}; image.Width = textureWidth * scale; image.Height = textureHeight * scale;
+                const float scale = std::min(width / displayWidth, height / textureHeight);
+                D3D11_VIEWPORT image{}; image.Width = displayWidth * scale; image.Height = textureHeight * scale;
                 image.TopLeftX = (width - image.Width) * 0.5f; image.TopLeftY = (height - image.Height) * 0.5f; image.MaxDepth = 1;
                 context->RSSetViewports(1, &image);
                 UINT stride = sizeof(Vertex), offset = 0; ID3D11Buffer* vb = vertexBuffer.Get();
                 context->IASetInputLayout(inputLayout.Get()); context->IASetVertexBuffers(0, 1, &vb, &stride, &offset); context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                context->VSSetShader(vertexShader.Get(), nullptr, 0); context->PSSetShader(pixelShader.Get(), nullptr, 0);
+                context->VSSetShader(vertexShader.Get(), nullptr, 0); context->PSSetShader(gpuYuy2Active ? yuy2PixelShader.Get() : pixelShader.Get(), nullptr, 0);
                 ID3D11ShaderResourceView* view = videoView.Get(); ID3D11SamplerState* smp = sampler.Get();
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
@@ -439,8 +469,8 @@ struct App {
             { std::lock_guard lock(captureMetricsMutex); measuredCaptureFps = captureFps; measuredCaptureP95 = captureP95Ms; }
             diagnostic = L"capture " + std::to_wstring(static_cast<int>(std::lround(measuredCaptureFps))) + L" fps; render " +
                 std::to_wstring(static_cast<int>(std::lround(renderFps))) + L" fps; replaced " + std::to_wstring(pending.replaced()) +
-                L"; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; convert " +
-                std::to_wstring(static_cast<int>(conversionMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
+                L"; GPU YUY2 " + (gpuYuy2Active ? L"active" : L"inactive") + L"; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
+                std::to_wstring(static_cast<int>(captureCopyMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
                 std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
                 (vsyncEnabled ? L"on" : L"off") + L" (app metrics; NOT input-to-photon)";
             update_title();

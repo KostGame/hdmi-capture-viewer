@@ -18,6 +18,15 @@ jobs:
         run: |
           cl /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp /Fe:hdmi-capture-viewer.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate embedded YUY2 GPU pixel shader
+        shell: pwsh
+        run: |
+          python tests/extract_yuy2_shader.py src/main.cpp yuy2_gpu_ci.hlsl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -File -Filter fxc.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName.ToLower().EndsWith('\x64\fxc.exe') } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $fxc) { throw 'Windows SDK FXC shader compiler is unavailable' }
+          & $fxc /nologo /T ps_4_0 /E PS /Fo yuy2_gpu_ci.cso yuy2_gpu_ci.hlsl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build and run latest-frame tests
         shell: pwsh
         run: |

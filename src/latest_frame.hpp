@@ -9,13 +9,25 @@
 
 namespace hcv {
 
+enum class PixelFormat { Bgra32, Yuy2 };
+
+inline bool packed_yuy2_size(int width, int height, std::size_t& bytes) {
+    if (width <= 0 || height <= 0 || (width & 1) != 0) return false;
+    const auto w = static_cast<std::size_t>(width);
+    const auto h = static_cast<std::size_t>(height);
+    if (w > static_cast<std::size_t>(-1) / 2 || w * 2 > static_cast<std::size_t>(-1) / h) return false;
+    bytes = w * 2 * h;
+    return true;
+}
+
 struct Frame {
     int width{};
     int height{};
     std::uint64_t sequence{};
-    std::vector<std::uint8_t> bgra;
+    PixelFormat format{PixelFormat::Bgra32};
+    std::vector<std::uint8_t> pixels;
     std::chrono::steady_clock::time_point capturedAt{std::chrono::steady_clock::now()};
-    double conversionMs{};
+    double captureCopyMs{};
 };
 
 // A one-slot mailbox: producers replace stale frames and consumers take the
