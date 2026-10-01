@@ -402,13 +402,17 @@ struct App {
         const char* yuy2Shader =
             "Texture2D packedTexture : register(t0);"
             "struct P { float4 p : SV_POSITION; float2 uv : TEXCOORD; };"
-            "float4 PS(P i) : SV_TARGET { uint tw,th; packedTexture.GetDimensions(tw,th);"
-            "uint ow=tw*2, oh=th; uint x=min((uint)(saturate(i.uv.x)*ow),ow-1);"
-            "uint y=min((uint)(saturate(i.uv.y)*oh),oh-1); float4 p=packedTexture.Load(int3(x/2,y,0));"
-            "float yy=((x&1)==0?p.r:p.b)*255.0, u=p.g*255.0-128.0, v=p.a*255.0-128.0;"
-            "float c=max(0.0,yy-16.0); float3 rgb=saturate(float3(floor((298*c+409*v+128)/256.0)/255.0,"
-            "floor((298*c-100*u-208*v+128)/256.0)/255.0,floor((298*c+516*u+128)/256.0)/255.0));"
-            "return float4(rgb,1.0); }";
+            "float3 decodeYuy2(uint x,uint y,uint tw,uint th){ uint ow=tw*2; x=min(x,ow-1); y=min(y,th-1);"
+            "float4 p=packedTexture.Load(int3(x/2,y,0)); float yy=((x&1)==0?p.r:p.b)*255.0;"
+            "float u=p.g*255.0-128.0,v=p.a*255.0-128.0,c=max(0.0,yy-16.0);"
+            "return saturate(float3((298*c+409*v+128)/256.0/255.0,"
+            "(298*c-100*u-208*v+128)/256.0/255.0,(298*c+516*u+128)/256.0/255.0));}"
+            "float4 PS(P i) : SV_TARGET { uint tw,th; packedTexture.GetDimensions(tw,th); uint ow=tw*2,oh=th;"
+            "float2 pos=saturate(i.uv)*float2(ow,oh)-0.5; pos=clamp(pos,float2(0,0),float2(ow-1,oh-1));"
+            "uint x0=(uint)floor(pos.x),y0=(uint)floor(pos.y); uint x1=min(x0+1,ow-1),y1=min(y0+1,oh-1);"
+            "float2 f=frac(pos); float3 a=lerp(decodeYuy2(x0,y0,tw,th),decodeYuy2(x1,y0,tw,th),f.x);"
+            "float3 b=lerp(decodeYuy2(x0,y1,tw,th),decodeYuy2(x1,y1,tw,th),f.x);"
+            "return float4(lerp(a,b,f.y),1.0); }";
         ComPtr<ID3DBlob> yuy2Ps;
         hr = D3DCompile(yuy2Shader, strlen(yuy2Shader), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &yuy2Ps, &errors);
         if (FAILED(hr) || FAILED(d3d->CreatePixelShader(yuy2Ps->GetBufferPointer(), yuy2Ps->GetBufferSize(), nullptr, &yuy2PixelShader))) return false;
@@ -549,45 +553,31 @@ struct App {
 
     void paint() { render(false); }
 
-    void fit_window_to_video_aspect() {
-        if (!window) return;
-        if (IsZoomed(window)) ShowWindow(window, SW_RESTORE);
-
-        RECT client{}, outer{};
-        if (!GetClientRect(window, &client) || !GetWindowRect(window, &outer)) return;
-        const int clientW = client.right - client.left;
-        const int clientH = client.bottom - client.top;
-
-        int videoW = static_cast<int>(displayWidth);
-        int videoH = static_cast<int>(textureHeight);
-        if ((videoW <= 0 || videoH <= 0) && selectedDevice < devices.size() &&
+    bool video_dimensions(int& width, int& height) const {
+        width = static_cast<int>(displayWidth);
+        height = static_cast<int>(textureHeight);
+        if ((width <= 0 || height <= 0) && selectedDevice < devices.size() &&
             selectedMode < devices[selectedDevice].modes.size()) {
             const auto& mode = devices[selectedDevice].modes[selectedMode];
-            videoW = static_cast<int>(mode.width);
-            videoH = static_cast<int>(mode.height);
+            width = static_cast<int>(mode.width);
+            height = static_cast<int>(mode.height);
         }
-        if (videoW <= 0 || videoH <= 0) return;
+        return width > 0 && height > 0;
+    }
 
-        const auto target = hcv::fit_inside_aspect(clientW, clientH, videoW, videoH);
-        if (target.width == clientW && target.height == clientH) return;
-
-        const int nonClientW = (outer.right - outer.left) - clientW;
-        const int nonClientH = (outer.bottom - outer.top) - clientH;
-        const int newOuterW = target.width + nonClientW;
-        const int newOuterH = target.height + nonClientH;
-
+    void place_window_size_preserving_corner(int newOuterW, int newOuterH, const RECT& oldOuter) {
         MONITORINFO mi{sizeof(mi)};
         if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi)) return;
         const RECT work = mi.rcWork;
-        constexpr int edgeSnapTolerance = 40;
+        constexpr int edgeSnapTolerance = 48;
         auto near_edge = [&](int a, int b) { return std::abs(a - b) <= edgeSnapTolerance; };
 
-        int x = outer.left;
-        int y = outer.top;
-        if (near_edge(outer.right, work.right)) x = work.right - newOuterW;
-        else if (near_edge(outer.left, work.left)) x = work.left;
-        if (near_edge(outer.bottom, work.bottom)) y = work.bottom - newOuterH;
-        else if (near_edge(outer.top, work.top)) y = work.top;
+        int x = oldOuter.left;
+        int y = oldOuter.top;
+        if (near_edge(oldOuter.right, work.right)) x = work.right - newOuterW;
+        else if (near_edge(oldOuter.left, work.left)) x = work.left;
+        if (near_edge(oldOuter.bottom, work.bottom)) y = work.bottom - newOuterH;
+        else if (near_edge(oldOuter.top, work.top)) y = work.top;
 
         x = std::clamp(x, static_cast<int>(work.left),
             std::max(static_cast<int>(work.left), static_cast<int>(work.right) - newOuterW));
@@ -595,6 +585,54 @@ struct App {
             std::max(static_cast<int>(work.top), static_cast<int>(work.bottom) - newOuterH));
         SetWindowPos(window, nullptr, x, y, newOuterW, newOuterH,
             SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    void set_video_pixels_100_percent() {
+        if (!window) return;
+        int videoW{}, videoH{};
+        if (!video_dimensions(videoW, videoH)) return;
+        if (IsZoomed(window)) ShowWindow(window, SW_RESTORE);
+
+        RECT outer{};
+        if (!GetWindowRect(window, &outer)) return;
+
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+        const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+        const UINT dpi = GetDpiForWindow(window);
+        RECT wanted{0, 0, videoW, videoH};
+        if (!AdjustWindowRectExForDpi(&wanted, style, GetMenu(window) != nullptr, exStyle, dpi)) return;
+
+        const int outerW = wanted.right - wanted.left;
+        const int outerH = wanted.bottom - wanted.top;
+        place_window_size_preserving_corner(outerW, outerH, outer);
+
+        // One bounded correction handles menu/nonclient rounding without cumulative growth.
+        RECT client{}, correctedOuter{};
+        if (GetClientRect(window, &client) && GetWindowRect(window, &correctedOuter)) {
+            const int actualW = client.right - client.left;
+            const int actualH = client.bottom - client.top;
+            if (actualW != videoW || actualH != videoH) {
+                const int correctedW = (correctedOuter.right - correctedOuter.left) + (videoW - actualW);
+                const int correctedH = (correctedOuter.bottom - correctedOuter.top) + (videoH - actualH);
+                place_window_size_preserving_corner(correctedW, correctedH, correctedOuter);
+            }
+        }
+    }
+
+    void fit_window_to_video_aspect() {
+        if (!window) return;
+        if (IsZoomed(window)) ShowWindow(window, SW_RESTORE);
+        RECT client{}, outer{};
+        if (!GetClientRect(window, &client) || !GetWindowRect(window, &outer)) return;
+        int videoW{}, videoH{};
+        if (!video_dimensions(videoW, videoH)) return;
+        const int clientW = client.right - client.left;
+        const int clientH = client.bottom - client.top;
+        const auto target = hcv::fit_inside_aspect(clientW, clientH, videoW, videoH);
+        if (target.width == clientW && target.height == clientH) return;
+        const int newOuterW = (outer.right - outer.left) + (target.width - clientW);
+        const int newOuterH = (outer.bottom - outer.top) + (target.height - clientH);
+        place_window_size_preserving_corner(newOuterW, newOuterH, outer);
     }
 
     void rebuild_menus() {
@@ -620,7 +658,8 @@ struct App {
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
-        AppendMenuW(windowMenu, MF_STRING, 3005, L"Fit video aspect (F9)");
+        AppendMenuW(windowMenu, MF_STRING, 3005, L"Video size 100% / source pixels (F9)");
+        AppendMenuW(windowMenu, MF_STRING, 3006, L"Fit video aspect inside current window");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
@@ -701,7 +740,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_F11 && app->borderless) { app->toggle_borderless(); return 0; }
-        if (wParam == VK_F9) { app->fit_window_to_video_aspect(); return 0; }
+        if (wParam == VK_F9) { app->set_video_pixels_100_percent(); return 0; }
         if (wParam == VK_F2) {
             std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
@@ -734,7 +773,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
-        if (id == 3005) { app->fit_window_to_video_aspect(); return 0; }
+        if (id == 3005) { app->set_video_pixels_100_percent(); return 0; }
+        if (id == 3006) { app->fit_window_to_video_aspect(); return 0; }
         if (id == 3002) {
             app->stop_capture(); app->devices = enumerate_devices(); app->selectedDevice = 0;
             app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[0]);
@@ -754,6 +794,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+    // Window/client geometry is specified in physical pixels. This matters on
+    // the owner's 4K desktop where Windows UI scaling is not 100%.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) { CoUninitialize(); return 1; }
     App state; app = &state;
@@ -762,7 +805,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     WNDCLASSW wc{}; wc.hInstance = instance; wc.lpfnWndProc = window_proc; wc.lpszClassName = L"HcvPreviewWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
-    RECT rect{0,0,1920,1080}; AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, TRUE);
+    const UINT initialDpi = GetDpiForSystem();
+    RECT rect{0,0,1920,1080};
+    AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, TRUE, 0, initialDpi);
     state.window = CreateWindowW(wc.lpszClassName, L"HDMI Capture Viewer", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
