@@ -159,6 +159,7 @@ struct App {
     double renderFps{};
     double submitMs{};
     double captureCopyMs{};
+    double yuy2ConvertSubmitMs{};
     double captureFps{};
     double captureP95Ms{};
     double presentMs{};
@@ -183,8 +184,9 @@ struct App {
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     DWORD savedStyle{};
-    RECT savedClientRect{};
+    RECT savedWindowRect{};
     HMENU savedMenu{};
+    int savedShowCmd{SW_SHOWNORMAL};
     hcv::ViewMode savedViewMode{hcv::ViewMode::Fit};
     float savedPanX{}, savedPanY{};
 
@@ -201,6 +203,9 @@ struct App {
     ComPtr<ID3D11RenderTargetView> backBufferView;
     ComPtr<ID3D11Texture2D> videoTexture;
     ComPtr<ID3D11ShaderResourceView> videoView;
+    ComPtr<ID3D11Texture2D> yuy2RgbTexture;
+    ComPtr<ID3D11RenderTargetView> yuy2RgbTarget;
+    ComPtr<ID3D11ShaderResourceView> yuy2RgbView;
     UINT textureWidth{};
     UINT textureHeight{};
     UINT displayWidth{};
@@ -434,11 +439,8 @@ struct App {
             "return saturate(float3((298*c+409*v+128)/256.0/255.0,"
             "(298*c-100*u-208*v+128)/256.0/255.0,(298*c+516*u+128)/256.0/255.0));}"
             "float4 PS(P i) : SV_TARGET { uint tw,th; packedTexture.GetDimensions(tw,th); uint ow=tw*2,oh=th;"
-            "float2 pos=saturate(i.uv)*float2(ow,oh)-0.5; pos=clamp(pos,float2(0,0),float2(ow-1,oh-1));"
-            "uint x0=(uint)floor(pos.x),y0=(uint)floor(pos.y); uint x1=min(x0+1,ow-1),y1=min(y0+1,oh-1);"
-            "float2 f=frac(pos); float3 a=lerp(decodeYuy2(x0,y0,tw,th),decodeYuy2(x1,y0,tw,th),f.x);"
-            "float3 b=lerp(decodeYuy2(x0,y1,tw,th),decodeYuy2(x1,y1,tw,th),f.x);"
-            "return float4(lerp(a,b,f.y),1.0); }";
+            "uint x=min((uint)i.p.x,ow-1),y=min((uint)i.p.y,oh-1);"
+            "return float4(decodeYuy2(x,y,tw,th),1.0); }";
         ComPtr<ID3DBlob> yuy2Ps;
         hr = D3DCompile(yuy2Shader, strlen(yuy2Shader), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &yuy2Ps, &errors);
         if (FAILED(hr) || FAILED(d3d->CreatePixelShader(yuy2Ps->GetBufferPointer(), yuy2Ps->GetBufferSize(), nullptr, &yuy2PixelShader))) return false;
@@ -486,6 +488,55 @@ struct App {
         return true;
     }
 
+    bool convert_yuy2_frame() {
+        if (!videoView || !yuy2RgbTarget || !yuy2RgbView) return false;
+        ID3D11RenderTargetView* previousTarget = nullptr;
+        ID3D11DepthStencilView* previousDepth = nullptr;
+        ID3D11ShaderResourceView* previousResource = nullptr;
+        context->OMGetRenderTargets(1, &previousTarget, &previousDepth);
+        context->PSGetShaderResources(0, 1, &previousResource);
+        ID3D11ShaderResourceView* none = nullptr;
+        context->PSSetShaderResources(0, 1, &none);
+        D3D11_VIEWPORT previousViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+        UINT previousViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        context->RSGetViewports(&previousViewportCount, previousViewports);
+
+        const auto start = Clock::now();
+        ID3D11RenderTargetView* conversionTarget = yuy2RgbTarget.Get();
+        context->OMSetRenderTargets(1, &conversionTarget, nullptr);
+        D3D11_VIEWPORT conversionViewport{};
+        conversionViewport.Width = static_cast<float>(displayWidth);
+        conversionViewport.Height = static_cast<float>(textureHeight);
+        conversionViewport.MaxDepth = 1.0f;
+        context->RSSetViewports(1, &conversionViewport);
+        const Vertex vertices[] = {{-1,1,0,0},{1,1,1,0},{-1,-1,0,1},{1,-1,1,1}};
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const bool submitted = SUCCEEDED(context->Map(vertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
+        if (submitted) {
+            std::memcpy(mapped.pData, vertices, sizeof(vertices));
+            context->Unmap(vertexBuffer.Get(), 0);
+            UINT stride = sizeof(Vertex), offset = 0;
+            ID3D11Buffer* vb = vertexBuffer.Get();
+            ID3D11ShaderResourceView* input = videoView.Get();
+            context->IASetInputLayout(inputLayout.Get());
+            context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context->VSSetShader(vertexShader.Get(), nullptr, 0);
+            context->PSSetShader(yuy2PixelShader.Get(), nullptr, 0);
+            context->PSSetShaderResources(0, 1, &input);
+            context->Draw(4, 0);
+        }
+        context->PSSetShaderResources(0, 1, &none);
+        context->OMSetRenderTargets(previousTarget ? 1 : 0, previousTarget ? &previousTarget : nullptr, previousDepth);
+        context->RSSetViewports(previousViewportCount, previousViewports);
+        context->PSSetShaderResources(0, 1, &previousResource);
+        if (previousTarget) previousTarget->Release();
+        if (previousDepth) previousDepth->Release();
+        if (previousResource) previousResource->Release();
+        yuy2ConvertSubmitMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        return submitted;
+    }
+
     void interactive_tick() {
         if (!interactiveMoveResize) return;
         const auto now = Clock::now();
@@ -507,11 +558,19 @@ struct App {
             const UINT texWidth = static_cast<UINT>(frame->format == hcv::PixelFormat::Yuy2 ? frame->width / 2 : frame->width);
             const UINT texHeight = static_cast<UINT>(frame->height);
             if (textureWidth != texWidth || textureHeight != texHeight || textureFormat != frame->format) {
-                videoView.Reset(); videoTexture.Reset();
+                videoView.Reset(); videoTexture.Reset(); yuy2RgbView.Reset(); yuy2RgbTarget.Reset(); yuy2RgbTexture.Reset();
                 D3D11_TEXTURE2D_DESC td{}; td.Width = texWidth; td.Height = texHeight; td.MipLevels = td.ArraySize = 1;
                 td.Format = frame->format == hcv::PixelFormat::Yuy2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
                 td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
                 if (FAILED(d3d->CreateTexture2D(&td, nullptr, &videoTexture)) || FAILED(d3d->CreateShaderResourceView(videoTexture.Get(), nullptr, &videoView))) return;
+                if (frame->format == hcv::PixelFormat::Yuy2) {
+                    D3D11_TEXTURE2D_DESC rgb{}; rgb.Width = static_cast<UINT>(frame->width); rgb.Height = static_cast<UINT>(frame->height);
+                    rgb.MipLevels = rgb.ArraySize = 1; rgb.Format = DXGI_FORMAT_B8G8R8A8_UNORM; rgb.SampleDesc.Count = 1;
+                    rgb.Usage = D3D11_USAGE_DEFAULT; rgb.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                    if (FAILED(d3d->CreateTexture2D(&rgb, nullptr, &yuy2RgbTexture)) ||
+                        FAILED(d3d->CreateRenderTargetView(yuy2RgbTexture.Get(), nullptr, &yuy2RgbTarget)) ||
+                        FAILED(d3d->CreateShaderResourceView(yuy2RgbTexture.Get(), nullptr, &yuy2RgbView))) return;
+                }
                 textureWidth = texWidth; textureHeight = texHeight; textureFormat = frame->format;
             }
             const std::size_t expected = static_cast<std::size_t>(frame->width) * frame->height * (frame->format == hcv::PixelFormat::Yuy2 ? 2 : 4);
@@ -521,6 +580,7 @@ struct App {
             context->UpdateSubresource(videoTexture.Get(), 0, nullptr, frame->pixels.data(), texWidth * 4, 0);
             displayWidth = static_cast<UINT>(frame->width);
             gpuYuy2Active = frame->format == hcv::PixelFormat::Yuy2;
+            if (gpuYuy2Active && !convert_yuy2_frame()) { set_status(L"GPU YUY2 source-resolution conversion failed."); return; }
             submitMs = std::chrono::duration<double, std::milli>(Clock::now() - frame->capturedAt).count();
             captureCopyMs = frame->captureCopyMs;
         }
@@ -539,7 +599,8 @@ struct App {
         }
         if (backBufferView) {
             const float black[] = {0,0,0,1}; ID3D11RenderTargetView* target = backBufferView.Get(); context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(backBufferView.Get(), black);
-            if (videoView && textureWidth && textureHeight && width > 0 && height > 0 && displayWidth) {
+            ID3D11ShaderResourceView* presentationView = gpuYuy2Active ? yuy2RgbView.Get() : videoView.Get();
+            if (presentationView && textureWidth && textureHeight && width > 0 && height > 0 && displayWidth) {
                 const auto layout=hcv::calculate_view(viewMode,static_cast<int>(width),static_cast<int>(height),static_cast<int>(displayWidth),static_cast<int>(textureHeight),panX,panY);
                 const auto& d=layout.destination; const auto& s=layout.source;
                 const float l=2*d.x/width-1, r=2*(d.x+d.width)/width-1, t=1-2*d.y/height, b=1-2*(d.y+d.height)/height;
@@ -550,8 +611,8 @@ struct App {
                 context->RSSetViewports(1,&image);
                 UINT stride = sizeof(Vertex), offset = 0; ID3D11Buffer* vb = vertexBuffer.Get();
                 context->IASetInputLayout(inputLayout.Get()); context->IASetVertexBuffers(0, 1, &vb, &stride, &offset); context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                context->VSSetShader(vertexShader.Get(), nullptr, 0); context->PSSetShader(gpuYuy2Active ? yuy2PixelShader.Get() : pixelShader.Get(), nullptr, 0);
-                ID3D11ShaderResourceView* view = videoView.Get(); ID3D11SamplerState* smp = sampler.Get();
+                context->VSSetShader(vertexShader.Get(), nullptr, 0); context->PSSetShader(pixelShader.Get(), nullptr, 0);
+                ID3D11ShaderResourceView* view = presentationView; ID3D11SamplerState* smp = sampler.Get();
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
                 if(viewMode==hcv::ViewMode::Pixel100){
@@ -587,7 +648,8 @@ struct App {
             { std::lock_guard lock(captureMetricsMutex); measuredCaptureFps = captureFps; measuredCaptureP95 = captureP95Ms; }
         diagnostic = L"capture " + std::to_wstring(static_cast<int>(std::lround(measuredCaptureFps))) + L" fps; render " +
                 std::to_wstring(static_cast<int>(std::lround(renderFps))) + L" fps; replaced " + std::to_wstring(pending.replaced()) +
-                L"; GPU YUY2 " + (gpuYuy2Active ? L"active" : L"inactive") + L"; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
+                L"; GPU YUY2 two-pass " + (gpuYuy2Active ? L"active" : L"inactive") + L"; convert submit " +
+                std::to_wstring(yuy2ConvertSubmitMs) + L"ms CPU; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
                 std::to_wstring(static_cast<int>(captureCopyMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
                 std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
@@ -721,27 +783,38 @@ struct App {
 
     void toggle_borderless() {
         if (!borderless) {
-            savedMenu = GetMenu(window);
-            SetMenu(window, nullptr);
             savedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
             savedPlacement.length = sizeof(savedPlacement); GetWindowPlacement(window, &savedPlacement);
-            GetWindowRect(window, &savedClientRect);
+            GetWindowRect(window, &savedWindowRect);
+            savedShowCmd = savedPlacement.showCmd;
+            savedMenu = GetMenu(window);
             savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
+            borderless = true;
+            SetMenu(window, nullptr);
             SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
             MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&mi);
             SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                 mi.rcMonitor.right-mi.rcMonitor.left,mi.rcMonitor.bottom-mi.rcMonitor.top,SWP_FRAMECHANGED);
             viewMode=hcv::ViewMode::Fill;
-            borderless = true;
         } else {
             SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
-            SetWindowPlacement(window, &savedPlacement);
             SetMenu(window,savedMenu);
-            SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
             borderless = false;
+            SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) {
+                ShowWindow(window, SW_MAXIMIZE);
+            } else {
+                const int width = savedWindowRect.right - savedWindowRect.left;
+                const int height = savedWindowRect.bottom - savedWindowRect.top;
+                SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE)
+                    ShowWindow(window, SW_MINIMIZE);
+            }
             viewMode=savedViewMode; panX=savedPanX; panY=savedPanY; savedMenu=nullptr;
         }
-        rebuild_menus();
+        if (!borderless) rebuild_menus();
+        else DrawMenuBar(window); // ensure the removed menu/non-client area is recalculated.
     }
 };
 
@@ -831,7 +904,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_SPACE) {app->spacePanning=true;return 0;}
-        if (wParam == VK_F11) { app->toggle_borderless(); return 0; }
+        if (wParam == VK_F11 && !(lParam & (1LL << 30))) { app->toggle_borderless(); return 0; }
+        if (wParam == VK_ESCAPE && app->borderless) { app->toggle_borderless(); return 0; }
         if (wParam == VK_F9) { app->set_video_pixels_100_percent(); return 0; }
         if (wParam == VK_F10) { app->viewMode=(GetKeyState(VK_CONTROL)&0x8000)?hcv::ViewMode::Fill:hcv::ViewMode::Fit;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
         if (wParam == VK_F2) {

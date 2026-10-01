@@ -27,6 +27,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_viewport_window_contract.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_borderless_restore_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_yuy2_two_pass_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native x64 application
         shell: pwsh
         run: |
