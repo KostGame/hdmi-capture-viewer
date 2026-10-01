@@ -15,6 +15,7 @@ struct Frame {
     std::uint64_t sequence{};
     std::vector<std::uint8_t> bgra;
     std::chrono::steady_clock::time_point capturedAt{std::chrono::steady_clock::now()};
+    double conversionMs{};
 };
 
 // A one-slot mailbox: producers replace stale frames and consumers take the

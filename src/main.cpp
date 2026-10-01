@@ -172,7 +172,18 @@ struct App {
     Clock::time_point fpsWindow = Clock::now();
     double renderFps{};
     double submitMs{};
+    double conversionMs{};
+    double captureFps{};
+    double captureP95Ms{};
+    double presentMs{};
+    std::uint64_t captureFrames{};
+    Clock::time_point captureWindow = Clock::now();
+    Clock::time_point previousCapture{};
+    std::vector<double> captureIntervals;
+    std::mutex captureMetricsMutex;
+    Clock::time_point lastTitleUpdate{};
     bool borderless{};
+    bool vsyncEnabled{true};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     DWORD savedStyle{};
     RECT savedClientRect{};
@@ -185,6 +196,7 @@ struct App {
     ComPtr<ID3D11InputLayout> inputLayout;
     ComPtr<ID3D11Buffer> vertexBuffer;
     ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11RenderTargetView> backBufferView;
     ComPtr<ID3D11Texture2D> videoTexture;
     ComPtr<ID3D11ShaderResourceView> videoView;
     UINT textureWidth{};
@@ -192,9 +204,12 @@ struct App {
 
     void set_status(std::wstring value) {
         captureStatus = std::move(value);
-        update_title();
+        update_title(true);
     }
-    void update_title() {
+    void update_title(bool force = false) {
+        const auto now = Clock::now();
+        if (!force && lastTitleUpdate.time_since_epoch().count() && now - lastTitleUpdate < std::chrono::seconds(1)) return;
+        lastTitleUpdate = now;
         std::wstring title = L"HDMI Capture Viewer — " + captureStatus;
         if (!diagnostic.empty()) title += L" | " + diagnostic;
         SetWindowTextW(window, title.c_str());
@@ -292,13 +307,33 @@ struct App {
                 const std::size_t rowBytes = static_cast<std::size_t>(mode.width) * bytesPerPixel;
                 const std::size_t frameBytes = rowBytes * mode.height;
                 if (length >= frameBytes) {
+                    {
+                        std::lock_guard lock(captureMetricsMutex);
+                        if (previousCapture.time_since_epoch().count()) captureIntervals.push_back(std::chrono::duration<double, std::milli>(sampleReadyAt - previousCapture).count());
+                        previousCapture = sampleReadyAt;
+                        ++captureFrames;
+                        const auto elapsed = std::chrono::duration<double>(sampleReadyAt - captureWindow).count();
+                        if (elapsed >= 1.0) {
+                            captureFps = captureFrames / elapsed;
+                            if (!captureIntervals.empty()) {
+                                auto sorted = captureIntervals;
+                                std::sort(sorted.begin(), sorted.end());
+                                captureP95Ms = sorted[static_cast<std::size_t>(0.95 * (sorted.size() - 1))];
+                            }
+                            captureFrames = 0;
+                            captureIntervals.clear();
+                            captureWindow = sampleReadyAt;
+                        }
+                    }
                     hcv::Frame frame;
                     frame.width = static_cast<int>(mode.width);
                     frame.height = static_cast<int>(mode.height);
                     frame.sequence = ++nextSequence;
                     frame.capturedAt = sampleReadyAt;
+                    const auto conversionStart = Clock::now();
                     if (directYuy2) yuy2_to_bgra(data, mode.width, mode.height, frame.bgra);
                     else frame.bgra.assign(data, data + frameBytes);
+                    frame.conversionMs = std::chrono::duration<double, std::milli>(Clock::now() - conversionStart).count();
                     pending.publish(std::move(frame));
                     // Keep the Win32 message queue bounded as well as the frame mailbox.
                     if (!frameWakeQueued.exchange(true, std::memory_order_acq_rel)) {
@@ -354,9 +389,9 @@ struct App {
         return true;
     }
 
-    void paint() {
+    void render(bool consumeFrame) {
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
-        auto frame = pending.take();
+        auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
         if (frame) {
             if (textureWidth != static_cast<UINT>(frame->width) || textureHeight != static_cast<UINT>(frame->height)) {
                 videoView.Reset(); videoTexture.Reset();
@@ -367,16 +402,18 @@ struct App {
             }
             context->UpdateSubresource(videoTexture.Get(), 0, nullptr, frame->bgra.data(), frame->width * 4, 0);
             submitMs = std::chrono::duration<double, std::milli>(Clock::now() - frame->capturedAt).count();
+            conversionMs = frame->conversionMs;
         }
         RECT rect{}; GetClientRect(window, &rect);
         const float width = static_cast<float>(rect.right), height = static_cast<float>(rect.bottom);
         D3D11_VIEWPORT viewport{}; viewport.Width = width; viewport.Height = height; viewport.MaxDepth = 1;
         context->RSSetViewports(1, &viewport);
-        ComPtr<ID3D11RenderTargetView> target;
-        ComPtr<ID3D11Texture2D> backBuffer;
-        if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) d3d->CreateRenderTargetView(backBuffer.Get(), nullptr, &target);
-        if (target) {
-            const float black[] = {0,0,0,1}; context->OMSetRenderTargets(1, target.GetAddressOf(), nullptr); context->ClearRenderTargetView(target.Get(), black);
+        if (!backBufferView) {
+            ComPtr<ID3D11Texture2D> backBuffer;
+            if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) d3d->CreateRenderTargetView(backBuffer.Get(), nullptr, &backBufferView);
+        }
+        if (backBufferView) {
+            const float black[] = {0,0,0,1}; ID3D11RenderTargetView* target = backBufferView.Get(); context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(backBufferView.Get(), black);
             if (videoView && textureWidth && textureHeight && width > 0 && height > 0) {
                 const float scale = std::min(width / textureWidth, height / textureHeight);
                 D3D11_VIEWPORT image{}; image.Width = textureWidth * scale; image.Height = textureHeight * scale;
@@ -389,18 +426,28 @@ struct App {
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
             }
-            swapChain->Present(1, 0);
+            const auto presentStart = Clock::now();
+            swapChain->Present(vsyncEnabled ? 1u : 0u, 0);
+            presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
         }
         if (frame) {
             ++presentedFrames;
             const auto now = Clock::now();
             const auto elapsed = std::chrono::duration<double>(now - fpsWindow).count();
             if (elapsed >= 1.0) { renderFps = presentedFrames / elapsed; presentedFrames = 0; fpsWindow = now; }
-            diagnostic = L"render " + std::to_wstring(static_cast<int>(std::lround(renderFps))) + L" fps; pending replacements " +
-                std::to_wstring(pending.replaced()) + L"; callback-to-submit " + std::to_wstring(static_cast<int>(submitMs)) + L" ms (not input-to-photon)";
+            double measuredCaptureFps, measuredCaptureP95;
+            { std::lock_guard lock(captureMetricsMutex); measuredCaptureFps = captureFps; measuredCaptureP95 = captureP95Ms; }
+            diagnostic = L"capture " + std::to_wstring(static_cast<int>(std::lround(measuredCaptureFps))) + L" fps; render " +
+                std::to_wstring(static_cast<int>(std::lround(renderFps))) + L" fps; replaced " + std::to_wstring(pending.replaced()) +
+                L"; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; convert " +
+                std::to_wstring(static_cast<int>(conversionMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
+                std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
+                (vsyncEnabled ? L"on" : L"off") + L" (app metrics; NOT input-to-photon)";
             update_title();
         }
     }
+
+    void paint() { render(false); }
 
     void rebuild_menus() {
         HMENU previous = GetMenu(window);
@@ -423,6 +470,8 @@ struct App {
         }
         AppendMenuW(windowMenu, MF_STRING | (borderless ? MF_CHECKED : 0), 3001, L"Borderless window");
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
+        AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
+        AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
@@ -460,12 +509,23 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
     case WM_PAINT: { PAINTSTRUCT ps{}; BeginPaint(hwnd, &ps); app->paint(); EndPaint(hwnd, &ps); return 0; }
-    case WM_SIZE: if (app->swapChain && wParam != SIZE_MINIMIZED) { app->context->OMSetRenderTargets(0, nullptr, nullptr); app->swapChain->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0); } InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    case WM_SIZE: if (app->swapChain && wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
+        app->context->OMSetRenderTargets(0, nullptr, nullptr);
+        app->backBufferView.Reset();
+        app->swapChain->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+    } InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_NEW_FRAME:
         app->frameWakeQueued.store(false, std::memory_order_release);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        app->render(true);
         return 0;
-    case WM_KEYDOWN: if (wParam == VK_F11 && app->borderless) { app->toggle_borderless(); return 0; } return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_F11 && app->borderless) { app->toggle_borderless(); return 0; }
+        if (wParam == VK_F2) {
+            std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
+            MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        return 0;
     case WM_CAPTURE_STATUS: {
         std::unique_ptr<std::wstring> value(reinterpret_cast<std::wstring*>(lParam));
         app->set_status(std::move(*value)); return 0;
@@ -480,6 +540,18 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             app->selectedMode = id - MODE_COMMAND_BASE; app->rebuild_menus(); app->start_capture(); return 0;
         }
         if (id == 3001) { app->toggle_borderless(); return 0; }
+        if (id == 3003) {
+            app->vsyncEnabled = !app->vsyncEnabled;
+            app->rebuild_menus();
+            // Recompute the diagnostic label on the next captured frame.
+            app->lastTitleUpdate = {};
+            return 0;
+        }
+        if (id == 3004) {
+            std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
+            MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
         if (id == 3002) {
             app->stop_capture(); app->devices = enumerate_devices(); app->selectedDevice = 0;
             app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[0]);
