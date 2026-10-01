@@ -589,8 +589,10 @@ struct App {
         if (near_edge(outer.bottom, work.bottom)) y = work.bottom - newOuterH;
         else if (near_edge(outer.top, work.top)) y = work.top;
 
-        x = std::clamp(x, work.left, std::max(work.left, work.right - newOuterW));
-        y = std::clamp(y, work.top, std::max(work.top, work.bottom - newOuterH));
+        x = std::clamp(x, static_cast<int>(work.left),
+            std::max(static_cast<int>(work.left), static_cast<int>(work.right) - newOuterW));
+        y = std::clamp(y, static_cast<int>(work.top),
+            std::max(static_cast<int>(work.top), static_cast<int>(work.bottom) - newOuterH));
         SetWindowPos(window, nullptr, x, y, newOuterW, newOuterH,
             SWP_NOZORDER | SWP_NOACTIVATE);
     }
