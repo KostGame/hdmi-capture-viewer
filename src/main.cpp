@@ -1191,11 +1191,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_COMMAND: {
         const UINT id = LOWORD(wParam);
         if (id >= DEVICE_COMMAND_BASE && id < DEVICE_COMMAND_BASE + MAX_MENU_ITEMS) {
-            app->selectedDevice = id - DEVICE_COMMAND_BASE;
-            app->selectedMode = preferred_mode(app->devices[app->selectedDevice]); app->rebuild_menus(); app->start_capture(); return 0;
+            const std::size_t index = id - DEVICE_COMMAND_BASE;
+            if (index >= app->devices.size()) return 0;
+            app->selectedDevice = index;
+            app->selectedMode = preferred_mode(app->devices[index]); app->rebuild_menus(); app->start_capture(); return 0;
         }
         if (id >= MODE_COMMAND_BASE && id < MODE_COMMAND_BASE + MAX_MENU_ITEMS) {
-            app->selectedMode = id - MODE_COMMAND_BASE; app->rebuild_menus(); app->start_capture(); return 0;
+            if (app->devices.empty() || app->selectedDevice >= app->devices.size()) return 0;
+            const std::size_t index = id - MODE_COMMAND_BASE;
+            if (index >= app->devices[app->selectedDevice].modes.size()) return 0;
+            app->selectedMode = index; app->rebuild_menus(); app->start_capture(); return 0;
         }
         if (id == 3001) { app->toggle_chrome(hcv::ChromeMode::Fullscreen); return 0; }
         if (id == 3009) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
