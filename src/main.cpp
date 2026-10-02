@@ -895,7 +895,8 @@ struct App {
         const int edge = resize_edge();
         const int x = std::max(edge, in.left + edge);
         const int y = std::max(edge, in.top + edge);
-        const int width = std::max(1, client.right - x - std::max(edge, in.right + edge));
+        const int clientRight = static_cast<int>(client.right);
+        const int width = std::max(1, clientRight - x - std::max(edge, in.right + edge));
         SetWindowPos(chromeOverlay, HWND_TOP, x, y, width, overlay_height(),
             SWP_NOACTIVATE | SWP_SHOWWINDOW);
         update_overlay_visibility();
