@@ -854,7 +854,8 @@ struct App {
     void update_overlay_visibility() {
         if (!chromeOverlay) return;
         const bool visible = overlayPolicy.visible();
-        if (IsWindowVisible(chromeOverlay) != visible) {
+        const bool currentlyVisible = IsWindowVisible(chromeOverlay) != FALSE;
+        if (currentlyVisible != visible) {
             ShowWindow(chromeOverlay, visible ? SW_SHOWNA : SW_HIDE);
             if (visible) InvalidateRect(chromeOverlay, nullptr, FALSE);
             request_view_render(); // redraw the matching internal border without changing parent geometry.
@@ -1064,7 +1065,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if (app->chromeOverlay) {
             RECT client{}; GetClientRect(hwnd, &client);
             const int edge = app->resize_edge();
-            SetWindowPos(app->chromeOverlay, HWND_TOP, edge, edge, std::max(0, client.right - 2 * edge),
+            const int overlayWidth = std::max(0, static_cast<int>(client.right) - 2 * edge);
+            SetWindowPos(app->chromeOverlay, HWND_TOP, edge, edge, overlayWidth,
                 app->overlay_height(), SWP_NOACTIVATE);
         }
         if (wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
