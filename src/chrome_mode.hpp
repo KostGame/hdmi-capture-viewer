@@ -7,6 +7,10 @@ namespace hcv {
 enum class ChromeMode { Normal, BorderlessWindow, Fullscreen };
 enum class ChromeState { NormalPinned, BorderlessAutoHide, FullscreenAutoHide };
 
+inline int reveal_strip_px(int dpi) noexcept {
+    return dpi > 0 ? (4 * dpi + 95) / 96 : 4;
+}
+
 inline ChromeState chrome_state(ChromeMode mode) noexcept {
     switch (mode) {
     case ChromeMode::Normal: return ChromeState::NormalPinned;

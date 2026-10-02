@@ -7,6 +7,9 @@ int main() {
     using hcv::ChromeState;
     hcv::OverlayVisibilityPolicy overlay;
 
+    assert(hcv::reveal_strip_px(96) == 4);
+    assert(hcv::reveal_strip_px(120) == 5);
+    assert(hcv::reveal_strip_px(144) == 6);
     assert(hcv::chrome_state(ChromeMode::Normal) == ChromeState::NormalPinned);
     assert(hcv::chrome_state(ChromeMode::BorderlessWindow) == ChromeState::BorderlessAutoHide);
     assert(hcv::chrome_state(ChromeMode::Fullscreen) == ChromeState::FullscreenAutoHide);
