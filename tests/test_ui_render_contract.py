@@ -17,7 +17,8 @@ assert "viewRenderQueued.try_queue()" in queue
 assert "PostMessageW(window, WM_VIEW_RENDER" in queue
 assert "coalescedViewRenderRequests" in queue
 assert "case WM_VIEW_RENDER:" in source and "viewRenderQueued.handled()" in source
-assert "void render(bool consumeFrame, bool forceWithoutFrame = false)" in source
-assert "render(true, true);" in source
+assert "void render(bool consumeFrame, bool forceWithoutFrame = false, bool uiImmediate = false)" in source
+assert "render(true, true, true);" in source
+assert "(interactiveMoveResize || uiImmediate) ? 0u" in source
 assert "merged view renders " in source
 print("UI_RENDER_COALESCING_CONTRACT_PASS")

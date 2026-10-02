@@ -206,9 +206,10 @@ struct App {
     }
 
     void render_view_request() {
-        // A view wakeup also consumes the newest capture frame when one is
-        // ready, so independent input events never create a frame queue.
-        render(true, true);
+        // UI-driven view changes must never wait for VSync on the window
+        // thread. The next normal capture frame returns to the user's VSync
+        // preference, while this immediate update stays responsive.
+        render(true, true, true);
     }
 
     ComPtr<ID3D11Device> d3d;
@@ -567,7 +568,7 @@ struct App {
         render(true);
     }
 
-    void render(bool consumeFrame, bool forceWithoutFrame = false) {
+    void render(bool consumeFrame, bool forceWithoutFrame = false, bool uiImmediate = false) {
         if (!window || IsIconic(window)) return;
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
         auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
@@ -656,7 +657,7 @@ struct App {
             const auto presentStart = Clock::now();
             // Waiting for VSync inside Windows' modal drag loop stalls mouse
             // tracking. Keep the user's VSync preference for normal playback.
-            swapChain->Present(interactiveMoveResize ? 0u : (vsyncEnabled ? 1u : 0u), 0);
+            swapChain->Present((interactiveMoveResize || uiImmediate) ? 0u : (vsyncEnabled ? 1u : 0u), 0);
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
         }
         if (frame) {
