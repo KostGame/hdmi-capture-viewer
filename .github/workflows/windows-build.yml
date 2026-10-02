@@ -13,10 +13,45 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Verify Media Foundation reader setup
+        shell: pwsh
+        run: |
+          python tests/test_capture_reader_init.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify interactive window resize contract
+        shell: pwsh
+        run: |
+          python tests/test_live_resize_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_pixel_perfect_window_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_viewport_window_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_borderless_restore_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_ui_render_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_yuy2_two_pass_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_menu_command_bounds.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_startup_ui_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_shortcut_encoding_contract.py src/main.cpp .github/workflows/windows-build.yml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native x64 application
         shell: pwsh
         run: |
-          cl /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp /Fe:hdmi-capture-viewer.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp /Fe:hdmi-capture-viewer.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate embedded YUY2 GPU pixel shader
+        shell: pwsh
+        run: |
+          python tests/extract_yuy2_shader.py src/main.cpp yuy2_gpu_ci.hlsl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -File -Filter fxc.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName.ToLower().EndsWith('\x64\fxc.exe') } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $fxc) { throw 'Windows SDK FXC shader compiler is unavailable' }
+          & $fxc /nologo /T ps_4_0 /E PS /Fo yuy2_gpu_ci.cso yuy2_gpu_ci.hlsl
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build and run latest-frame tests
         shell: pwsh
@@ -24,6 +59,26 @@ jobs:
           cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\latest_frame_tests.cpp /Fe:latest_frame_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\latest_frame_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\resize_gate_tests.cpp /Fe:resize_gate_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\resize_gate_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\window_geometry_tests.cpp /Fe:window_geometry_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\window_geometry_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\viewport_math_tests.cpp /Fe:viewport_math_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\viewport_math_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\coalesced_request_tests.cpp /Fe:coalesced_request_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\coalesced_request_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\chrome_mode_tests.cpp /Fe:chrome_mode_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\chrome_mode_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload Windows x64 preview
         uses: actions/upload-artifact@v4
