@@ -16,5 +16,5 @@ assert 'case WM_TIMER:' in source
 assert 'case WM_MOVING:' in source and 'case WM_SIZING:' in source
 assert 'context->Flush();' in source
 assert 'resizeGate.completed(now);' in source
-assert 'interactiveMoveResize ? 0u' in source
+assert '(interactiveMoveResize || uiImmediate) ? 0u' in source
 print('LIVE_RESIZE_CONTRACT_PASS')
