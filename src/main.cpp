@@ -175,17 +175,19 @@ struct App {
     std::mutex captureMetricsMutex;
     Clock::time_point lastTitleUpdate{};
     hcv::ChromeMode chromeMode{hcv::ChromeMode::Normal};
-    hcv::ViewMode viewMode{hcv::ViewMode::Fit};
+    hcv::ViewMode viewMode{hcv::ViewMode::Auto};
     float panX{}, panY{};
-    bool spacePanning{}, draggingPan{};
+    bool spacePanning{}, draggingPan{}, draggingMove{};
     POINT dragOrigin{};
     float dragPanX{}, dragPanY{};
+    POINT moveCursorOrigin{};
+    RECT moveWindowOrigin{};
     bool vsyncEnabled{true};
     bool interactiveMoveResize{};
     hcv::ResizeGate resizeGate;
     Clock::time_point lastInteractivePaint{};
     UINT swapWidth{}, swapHeight{};
-    std::uint64_t resizeCount{}, resizeFailures{}, liveMoveFrames{};
+    std::uint64_t resizeCount{}, resizeFailures{}, liveMoveFrames{}, skippedInteractivePresent{};
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     hcv::ChromeMode savedChromeMode{hcv::ChromeMode::Normal};
@@ -193,7 +195,7 @@ struct App {
     RECT savedWindowRect{};
     HMENU savedMenu{};
     int savedShowCmd{SW_SHOWNORMAL};
-    hcv::ViewMode savedViewMode{hcv::ViewMode::Fit};
+    hcv::ViewMode savedViewMode{hcv::ViewMode::Auto};
     float savedPanX{}, savedPanY{};
 
     void request_view_render() {
@@ -427,6 +429,8 @@ struct App {
         HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
             D3D11_SDK_VERSION, &desc, &swapChain, &d3d, &level, &context);
         if (FAILED(hr)) return false;
+        ComPtr<IDXGIDevice1> dxgiDevice;
+        if (SUCCEEDED(d3d.As(&dxgiDevice))) dxgiDevice->SetMaximumFrameLatency(1);
         swapWidth = desc.BufferDesc.Width;
         swapHeight = desc.BufferDesc.Height;
         const char* shader = "Texture2D videoTexture : register(t0); SamplerState videoSampler : register(s0);"
@@ -483,10 +487,11 @@ struct App {
     // WM_SIZE only records the newest dimensions. Releasing the render target
     // and resizing the swap chain at every intermediate mouse position causes
     // severe stalls and flicker during interactive drag/resize.
-    bool apply_pending_resize(bool force = false) {
+    bool apply_pending_resize() {
         if (!swapChain) return true;
+        if (interactiveMoveResize) return true; // Keep rendering to the old buffer throughout native resize.
         const auto now = Clock::now();
-        if (!resizeGate.ready(now, interactiveMoveResize && !force)) return true;
+        if (!resizeGate.ready(now, false)) return true;
         const UINT w = static_cast<UINT>(resizeGate.width());
         const UINT h = static_cast<UINT>(resizeGate.height());
         if (w == swapWidth && h == swapHeight) {
@@ -497,7 +502,6 @@ struct App {
         backBufferView.Reset();
         context->Flush();
         const HRESULT hr = swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
-        resizeGate.attempted(now);
         if (FAILED(hr)) {
             ++resizeFailures;
             lastResizeError = hr;
@@ -657,8 +661,15 @@ struct App {
             const auto presentStart = Clock::now();
             // Waiting for VSync inside Windows' modal drag loop stalls mouse
             // tracking. Keep the user's VSync preference for normal playback.
-            swapChain->Present((interactiveMoveResize || uiImmediate) ? 0u : (vsyncEnabled ? 1u : 0u), 0);
+            const bool nonblockingPresent = interactiveMoveResize || draggingMove || uiImmediate;
+            const HRESULT presentResult = swapChain->Present(
+                nonblockingPresent ? 0u : (vsyncEnabled ? 1u : 0u),
+                nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
+            if (nonblockingPresent && presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
+                ++skippedInteractivePresent;
+                return;
+            }
         }
         if (frame) {
             if (interactiveMoveResize) ++liveMoveFrames;
@@ -676,14 +687,15 @@ struct App {
                 std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
+                L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
-                L"; view " + (viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; merged view renders " + std::to_wstring(coalescedViewRenderRequests) + L"; live frames " + std::to_wstring(liveMoveFrames) +
+                L"; view " + (viewMode==hcv::ViewMode::Auto?L"Auto":viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; merged view renders " + std::to_wstring(coalescedViewRenderRequests) + L"; live frames " + std::to_wstring(liveMoveFrames) +
                 L" (app metrics; NOT input-to-photon)";
             update_title();
         }
     }
 
-    void paint() { render(false); }
+    void paint() { render(false, false, true); }
 
     bool video_dimensions(int& width, int& height) const {
         width = static_cast<int>(displayWidth);
@@ -795,9 +807,10 @@ struct App {
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
+        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Auto?MF_CHECKED:0), 3010, L"Auto / whole frame (Shift+F10)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Pixel100?MF_CHECKED:0), 3005, L"100% / Pixel (F9)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fit?MF_CHECKED:0), 3006, L"Fit (F10)");
-        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fill?MF_CHECKED:0), 3008, L"Fill");
+        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fill?MF_CHECKED:0), 3008, L"Fill (Ctrl+F10)");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
@@ -810,6 +823,7 @@ struct App {
         HMENU root = GetMenu(window);
         HMENU windowMenu = root ? GetSubMenu(root, 2) : nullptr;
         if (!windowMenu) return;
+        CheckMenuItem(windowMenu, 3010, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Auto ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(windowMenu, 3005, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Pixel100 ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(windowMenu, 3006, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Fit ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(windowMenu, 3008, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Fill ? MF_CHECKED : MF_UNCHECKED));
@@ -900,7 +914,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_EXITSIZEMOVE:
         KillTimer(hwnd, LIVE_MOVE_TIMER);
         app->interactiveMoveResize = false;
-        app->render(true); // Apply the exact final size immediately.
+        app->render(true, true, true); // Apply at most the newest pending size once, then render it.
         app->update_title(true);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -932,13 +946,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if(hcv::frameless(app->chromeMode)){
             POINT p{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&p);RECT c{};GetClientRect(hwnd,&c);
             const int edge=std::max(1,static_cast<int>(std::lround(8.0*GetDpiForWindow(hwnd)/96.0)));
-            const int caption=std::max(edge,static_cast<int>(std::lround(24.0*GetDpiForWindow(hwnd)/96.0)));
-            switch(hcv::borderless_hit_test(p.x,p.y,c.right,c.bottom,edge,caption)){
+            switch(hcv::borderless_hit_test(p.x,p.y,c.right,c.bottom,edge)){
             case hcv::ResizeEdge::Left:return HTLEFT; case hcv::ResizeEdge::Right:return HTRIGHT;
             case hcv::ResizeEdge::Top:return HTTOP; case hcv::ResizeEdge::Bottom:return HTBOTTOM;
             case hcv::ResizeEdge::TopLeft:return HTTOPLEFT; case hcv::ResizeEdge::TopRight:return HTTOPRIGHT;
             case hcv::ResizeEdge::BottomLeft:return HTBOTTOMLEFT; case hcv::ResizeEdge::BottomRight:return HTBOTTOMRIGHT;
-            case hcv::ResizeEdge::Caption:return HTCAPTION; default:break;
+            default:return HTCLIENT;
             }
         }
         return DefWindowProcW(hwnd,message,wParam,lParam);
@@ -955,12 +968,34 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_LBUTTONDOWN:
         if(app->viewMode==hcv::ViewMode::Pixel100&&app->spacePanning){app->draggingPan=true;app->dragOrigin={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};app->dragPanX=app->panX;app->dragPanY=app->panY;SetCapture(hwnd);return 0;}
+        if(app->chromeMode==hcv::ChromeMode::BorderlessWindow && (GetKeyState(VK_MENU)&0x8000)){
+            app->draggingMove=true;
+            GetCursorPos(&app->moveCursorOrigin);
+            GetWindowRect(hwnd,&app->moveWindowOrigin);
+            SetCapture(hwnd);
+            return 0;
+        }
         break;
     case WM_MOUSEMOVE:
+        if(app->draggingMove){POINT cursor{};if(GetCursorPos(&cursor))SetWindowPos(hwnd,nullptr,
+            app->moveWindowOrigin.left+cursor.x-app->moveCursorOrigin.x,
+            app->moveWindowOrigin.top+cursor.y-app->moveCursorOrigin.y,0,0,
+            SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);return 0;}
         if(app->draggingPan){RECT c{};GetClientRect(hwnd,&c);app->panX=hcv::clamp_pan(app->dragPanX-(GET_X_LPARAM(lParam)-app->dragOrigin.x),static_cast<int>(app->displayWidth),c.right);app->panY=hcv::clamp_pan(app->dragPanY-(GET_Y_LPARAM(lParam)-app->dragOrigin.y),static_cast<int>(app->textureHeight),c.bottom);app->request_view_render();return 0;}
         break;
     case WM_LBUTTONUP:
-        if(app->draggingPan){app->draggingPan=false;ReleaseCapture();return 0;}
+        if(app->draggingPan||app->draggingMove){app->draggingPan=false;app->draggingMove=false;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
+        break;
+    case WM_CANCELMODE:
+        app->draggingPan=false;app->draggingMove=false;app->spacePanning=false;
+        if(GetCapture()==hwnd)ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        app->draggingPan=false;app->draggingMove=false;
+        break;
+    case WM_KILLFOCUS:
+        app->draggingPan=false;app->draggingMove=false;app->spacePanning=false;
+        if(GetCapture()==hwnd)ReleaseCapture();
         break;
     case WM_NEW_FRAME:
         app->frameWakeQueued.store(false, std::memory_order_release);
@@ -978,7 +1013,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if (wParam == VK_F11 && !(lParam & (1LL << 30)) && (GetKeyState(VK_CONTROL)&0x8000)) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
         if (wParam == VK_ESCAPE && app->chromeMode != hcv::ChromeMode::Normal) { app->toggle_chrome(app->chromeMode); return 0; }
         if (wParam == VK_F9) { app->set_video_pixels_100_percent(); return 0; }
-        if (wParam == VK_F10) { app->viewMode=(GetKeyState(VK_CONTROL)&0x8000)?hcv::ViewMode::Fill:hcv::ViewMode::Fit;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
+        if (wParam == VK_F10) {
+            const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+            const bool shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+            app->viewMode=ctrl?hcv::ViewMode::Fill:(shift?hcv::ViewMode::Auto:hcv::ViewMode::Fit);
+            app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0;
+        }
         if (wParam == VK_F2) {
             std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
@@ -1012,6 +1052,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
+        if (id == 3010) { app->viewMode=hcv::ViewMode::Auto;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (id == 3005) { app->set_video_pixels_100_percent(); return 0; }
         if (id == 3006) { app->viewMode=hcv::ViewMode::Fit;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (id == 3008) { app->viewMode=hcv::ViewMode::Fill;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }

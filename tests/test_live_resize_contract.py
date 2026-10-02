@@ -16,5 +16,12 @@ assert 'case WM_TIMER:' in source
 assert 'case WM_MOVING:' in source and 'case WM_SIZING:' in source
 assert 'context->Flush();' in source
 assert 'resizeGate.completed(now);' in source
-assert '(interactiveMoveResize || uiImmediate) ? 0u' in source
+resize = source[source.index('bool apply_pending_resize()'):source.index('bool convert_yuy2_frame()')]
+assert 'if (interactiveMoveResize) return true;' in resize
+assert resize.index('if (interactiveMoveResize) return true;') < resize.index('ResizeBuffers(')
+exit_handler = source[source.index('case WM_EXITSIZEMOVE:'):source.index('case WM_MOVING:')]
+assert exit_handler.index('interactiveMoveResize = false;') < exit_handler.index('app->render(true, true, true);')
+assert 'interactiveMoveResize || draggingMove || uiImmediate' in source
+assert 'DXGI_PRESENT_DO_NOT_WAIT' in source
+assert 'DXGI_ERROR_WAS_STILL_DRAWING' in source and '++skippedInteractivePresent' in source
 print('LIVE_RESIZE_CONTRACT_PASS')

@@ -17,6 +17,10 @@ assert "SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top,
 assert "SetMenu(window, nullptr);" in chrome
 assert "chromeMode = hcv::ChromeMode::Normal;" in chrome
 assert "wParam == VK_F11" in source and "GetKeyState(VK_CONTROL)" in source
+assert "GetKeyState(VK_MENU)" in source
+assert "SetCapture(hwnd)" in source and "GetCursorPos(&cursor)" in source
+assert "SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE" in source
+assert "HTCAPTION" not in source
 assert "app->toggle_chrome(hcv::ChromeMode::Fullscreen)" in source
 assert "app->toggle_chrome(hcv::ChromeMode::BorderlessWindow)" in source
 assert "VK_ESCAPE && app->chromeMode != hcv::ChromeMode::Normal" in source
