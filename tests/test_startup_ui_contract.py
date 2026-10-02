@@ -18,6 +18,8 @@ for token in (
     'Keyboard help (F1)',
     'Auto-hide chrome (Ctrl+B)',
     'WM_NCLBUTTONDOWN, HTCAPTION',
+    'WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN',
+    'case WM_NCMOUSEMOVE:',
 ):
     assert token in source, f"missing startup/UI contract: {token}"
 

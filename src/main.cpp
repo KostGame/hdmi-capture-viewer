@@ -1187,6 +1187,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         }
         break;
+    case WM_NCMOUSEMOVE:
+        if (app->overlayPolicy.auto_hide()) {
+            app->overlayPolicy.reveal(GetTickCount64());
+            app->update_overlay_visibility();
+        }
+        break;
     case WM_MOUSEMOVE:
         {
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
@@ -1374,7 +1380,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     WNDCLASSW wc{}; wc.hInstance = instance; wc.lpfnWndProc = window_proc; wc.lpszClassName = L"HcvPreviewWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
-    state.window = CreateWindowW(wc.lpszClassName, L"HDMI Capture Viewer", WS_OVERLAPPEDWINDOW,
+    state.window = CreateWindowW(wc.lpszClassName, L"HDMI Capture Viewer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1920, 1080, nullptr, nullptr, instance, nullptr);
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
