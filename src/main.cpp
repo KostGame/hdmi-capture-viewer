@@ -11,6 +11,8 @@
 #include <wrl/client.h>
 
 #include "latest_frame.hpp"
+#include "coalesced_request.hpp"
+#include "chrome_mode.hpp"
 #include "resize_gate.hpp"
 #include "window_geometry.hpp"
 #include "viewport_math.hpp"
@@ -42,6 +44,7 @@ using Clock = std::chrono::steady_clock;
 namespace {
 constexpr UINT WM_NEW_FRAME = WM_APP + 1;
 constexpr UINT WM_CAPTURE_STATUS = WM_APP + 2;
+constexpr UINT WM_VIEW_RENDER = WM_APP + 3;
 constexpr UINT_PTR LIVE_MOVE_TIMER = 7;
 constexpr UINT LIVE_MOVE_TIMER_PERIOD_MS = 16;
 constexpr UINT DEVICE_COMMAND_BASE = 1000;
@@ -150,6 +153,8 @@ struct App {
     std::thread captureThread;
     std::atomic<bool> stopCapture{false};
     std::atomic<bool> frameWakeQueued{false};
+    hcv::CoalescedRequest viewRenderQueued;
+    std::uint64_t coalescedViewRenderRequests{};
     hcv::LatestFrame pending;
     std::uint64_t nextSequence{};
     std::wstring captureStatus = L"Choose a capture device from the Device menu.";
@@ -169,7 +174,7 @@ struct App {
     std::vector<double> captureIntervals;
     std::mutex captureMetricsMutex;
     Clock::time_point lastTitleUpdate{};
-    bool borderless{};
+    hcv::ChromeMode chromeMode{hcv::ChromeMode::Normal};
     hcv::ViewMode viewMode{hcv::ViewMode::Fit};
     float panX{}, panY{};
     bool spacePanning{}, draggingPan{};
@@ -183,12 +188,28 @@ struct App {
     std::uint64_t resizeCount{}, resizeFailures{}, liveMoveFrames{};
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
+    hcv::ChromeMode savedChromeMode{hcv::ChromeMode::Normal};
     DWORD savedStyle{};
     RECT savedWindowRect{};
     HMENU savedMenu{};
     int savedShowCmd{SW_SHOWNORMAL};
     hcv::ViewMode savedViewMode{hcv::ViewMode::Fit};
     float savedPanX{}, savedPanY{};
+
+    void request_view_render() {
+        if (!window) return;
+        if (!viewRenderQueued.try_queue()) {
+            ++coalescedViewRenderRequests;
+            return;
+        }
+        if (!PostMessageW(window, WM_VIEW_RENDER, 0, 0)) viewRenderQueued.cancel();
+    }
+
+    void render_view_request() {
+        // A view wakeup also consumes the newest capture frame when one is
+        // ready, so independent input events never create a frame queue.
+        render(true, true);
+    }
 
     ComPtr<ID3D11Device> d3d;
     ComPtr<ID3D11DeviceContext> context;
@@ -546,13 +567,13 @@ struct App {
         render(true);
     }
 
-    void render(bool consumeFrame) {
+    void render(bool consumeFrame, bool forceWithoutFrame = false) {
         if (!window || IsIconic(window)) return;
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
         auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
         // Timer + posted wakeups may race to process the same frame. Never
         // present duplicates unless a resize or explicit paint needs it.
-        if (consumeFrame && !frame && !resizeGate.ready(Clock::now(), interactiveMoveResize)) return;
+        if (consumeFrame && !frame && !forceWithoutFrame && !resizeGate.ready(Clock::now(), interactiveMoveResize)) return;
         if (!apply_pending_resize()) return;
         if (frame) {
             const UINT texWidth = static_cast<UINT>(frame->format == hcv::PixelFormat::Yuy2 ? frame->width / 2 : frame->width);
@@ -655,7 +676,7 @@ struct App {
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
-                L"; view " + (viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; live frames " + std::to_wstring(liveMoveFrames) +
+                L"; view " + (viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; merged view renders " + std::to_wstring(coalescedViewRenderRequests) + L"; live frames " + std::to_wstring(liveMoveFrames) +
                 L" (app metrics; NOT input-to-photon)";
             update_title();
         }
@@ -702,7 +723,7 @@ struct App {
         int videoW{}, videoH{};
         if (!video_dimensions(videoW, videoH)) return;
         viewMode=hcv::ViewMode::Pixel100; panX=panY=0;
-        if (borderless) { render(false); return; }
+        if (chromeMode != hcv::ChromeMode::Normal) { update_view_menu_checks(); request_view_render(); return; }
         if (IsZoomed(window)) ShowWindow(window, SW_RESTORE);
 
         RECT outer{};
@@ -729,6 +750,8 @@ struct App {
                 place_window_size_preserving_corner(correctedW, correctedH, correctedOuter);
             }
         }
+        update_view_menu_checks();
+        request_view_render();
     }
 
     void fit_window_to_video_aspect() {
@@ -749,7 +772,7 @@ struct App {
 
     void rebuild_menus() {
         HMENU previous = GetMenu(window);
-        if (borderless) {
+        if (hcv::frameless(chromeMode)) {
             SetMenu(window, nullptr);
             if (previous) DestroyMenu(previous);
             return;
@@ -766,7 +789,8 @@ struct App {
                 AppendMenuW(formatMenu, MF_STRING | (i == selectedMode ? MF_CHECKED : 0), MODE_COMMAND_BASE + static_cast<UINT>(i), label.c_str());
             }
         }
-        AppendMenuW(windowMenu, MF_STRING | (borderless ? MF_CHECKED : 0), 3001, L"Borderless window (F11)");
+        AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::Fullscreen ? MF_CHECKED : 0), 3001, L"Fullscreen (F11)");
+        AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::BorderlessWindow ? MF_CHECKED : 0), 3009, L"Borderless window (Ctrl+F11)");
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
@@ -781,40 +805,80 @@ struct App {
         DrawMenuBar(window);
     }
 
-    void toggle_borderless() {
-        if (!borderless) {
-            savedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
-            savedPlacement.length = sizeof(savedPlacement); GetWindowPlacement(window, &savedPlacement);
-            GetWindowRect(window, &savedWindowRect);
-            savedShowCmd = savedPlacement.showCmd;
-            savedMenu = GetMenu(window);
-            savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
-            borderless = true;
-            SetMenu(window, nullptr);
-            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
-            MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&mi);
-            SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                mi.rcMonitor.right-mi.rcMonitor.left,mi.rcMonitor.bottom-mi.rcMonitor.top,SWP_FRAMECHANGED);
-            viewMode=hcv::ViewMode::Fill;
+    void update_view_menu_checks() {
+        HMENU root = GetMenu(window);
+        HMENU windowMenu = root ? GetSubMenu(root, 2) : nullptr;
+        if (!windowMenu) return;
+        CheckMenuItem(windowMenu, 3005, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Pixel100 ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(windowMenu, 3006, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Fit ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(windowMenu, 3008, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Fill ? MF_CHECKED : MF_UNCHECKED));
+    }
+
+    void restore_normal_chrome() {
+        SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
+        chromeMode = hcv::ChromeMode::Normal;
+        SetMenu(window, savedMenu);
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) {
+            ShowWindow(window, SW_MAXIMIZE);
         } else {
-            SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
-            SetMenu(window,savedMenu);
-            borderless = false;
-            SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) {
-                ShowWindow(window, SW_MAXIMIZE);
-            } else {
-                const int width = savedWindowRect.right - savedWindowRect.left;
-                const int height = savedWindowRect.bottom - savedWindowRect.top;
-                SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-                if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE)
-                    ShowWindow(window, SW_MINIMIZE);
-            }
-            viewMode=savedViewMode; panX=savedPanX; panY=savedPanY; savedMenu=nullptr;
+            const int width = savedWindowRect.right - savedWindowRect.left;
+            const int height = savedWindowRect.bottom - savedWindowRect.top;
+            SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE)
+                ShowWindow(window, SW_MINIMIZE);
         }
-        if (!borderless) rebuild_menus();
-        else DrawMenuBar(window); // ensure the removed menu/non-client area is recalculated.
+        if (savedChromeMode == hcv::ChromeMode::Fullscreen) {
+            viewMode=savedViewMode; panX=savedPanX; panY=savedPanY;
+        }
+        savedMenu=nullptr;
+        DrawMenuBar(window);
+    }
+
+    void toggle_chrome(hcv::ChromeMode requested) {
+        if (chromeMode == requested) {
+            restore_normal_chrome();
+            rebuild_menus();
+            request_view_render();
+            return;
+        }
+        // Switching modes always passes through the saved normal state. This
+        // keeps the intended pre-mode rectangle and view state deterministic.
+        if (chromeMode != hcv::ChromeMode::Normal) restore_normal_chrome();
+
+        savedChromeMode = requested;
+        savedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+        savedPlacement.length = sizeof(savedPlacement);
+        GetWindowPlacement(window, &savedPlacement);
+        GetWindowRect(window, &savedWindowRect);
+        savedShowCmd = savedPlacement.showCmd;
+        savedMenu = GetMenu(window);
+        if (requested == hcv::ChromeMode::Fullscreen) {
+            savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
+        }
+        SetMenu(window, nullptr);
+        SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
+        chromeMode = requested;
+        if (requested == hcv::ChromeMode::Fullscreen) {
+            MONITORINFO mi{sizeof(mi)};
+            GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
+            SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE);
+            viewMode=hcv::ViewMode::Fill;
+            panX=panY=0;
+        } else {
+            const int width = savedWindowRect.right - savedWindowRect.left;
+            const int height = savedWindowRect.bottom - savedWindowRect.top;
+            const auto exactRect = hcv::same_outer_rect_after_chrome_change(
+                {savedWindowRect.left, savedWindowRect.top, savedWindowRect.right, savedWindowRect.bottom});
+            SetWindowPos(window, nullptr, exactRect.left, exactRect.top, width, height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        DrawMenuBar(window);
+        request_view_render();
     }
 };
 
@@ -824,7 +888,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
     case WM_NCCALCSIZE:
-        if(app->borderless) return 0; // Keep the sizing frame entirely inside the client area.
+        if(hcv::frameless(app->chromeMode)) return 0; // Keep resize borders inside the client area.
         break;
     case WM_ERASEBKGND: return 1; // D3D paints the whole client: prevent white/gray flashes.
     case WM_ENTERSIZEMOVE:
@@ -860,11 +924,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
             app->resizeGate.request(LOWORD(lParam), HIWORD(lParam));
-            if (!app->interactiveMoveResize) InvalidateRect(hwnd, nullptr, FALSE);
+            if (!app->interactiveMoveResize) app->request_view_render();
         }
         return 0;
     case WM_NCHITTEST:
-        if(app->borderless){
+        if(hcv::frameless(app->chromeMode)){
             POINT p{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&p);RECT c{};GetClientRect(hwnd,&c);
             const int edge=std::max(1,static_cast<int>(std::lround(8.0*GetDpiForWindow(hwnd)/96.0)));
             const int caption=std::max(edge,static_cast<int>(std::lround(24.0*GetDpiForWindow(hwnd)/96.0)));
@@ -882,7 +946,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             RECT c{};GetClientRect(hwnd,&c);const int delta=GET_WHEEL_DELTA_WPARAM(wParam)/WHEEL_DELTA*60*(GET_KEYSTATE_WPARAM(wParam)&MK_SHIFT?-1:1);
             if(GET_KEYSTATE_WPARAM(wParam)&MK_SHIFT)app->panX=hcv::clamp_pan(app->panX-delta,static_cast<int>(app->displayWidth),c.right);
             else app->panY=hcv::clamp_pan(app->panY-delta,static_cast<int>(app->textureHeight),c.bottom);
-            app->render(false);return 0;
+            app->request_view_render();return 0;
         }
         break;
     case WM_KEYUP:
@@ -892,7 +956,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if(app->viewMode==hcv::ViewMode::Pixel100&&app->spacePanning){app->draggingPan=true;app->dragOrigin={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};app->dragPanX=app->panX;app->dragPanY=app->panY;SetCapture(hwnd);return 0;}
         break;
     case WM_MOUSEMOVE:
-        if(app->draggingPan){RECT c{};GetClientRect(hwnd,&c);app->panX=hcv::clamp_pan(app->dragPanX-(GET_X_LPARAM(lParam)-app->dragOrigin.x),static_cast<int>(app->displayWidth),c.right);app->panY=hcv::clamp_pan(app->dragPanY-(GET_Y_LPARAM(lParam)-app->dragOrigin.y),static_cast<int>(app->textureHeight),c.bottom);app->render(false);return 0;}
+        if(app->draggingPan){RECT c{};GetClientRect(hwnd,&c);app->panX=hcv::clamp_pan(app->dragPanX-(GET_X_LPARAM(lParam)-app->dragOrigin.x),static_cast<int>(app->displayWidth),c.right);app->panY=hcv::clamp_pan(app->dragPanY-(GET_Y_LPARAM(lParam)-app->dragOrigin.y),static_cast<int>(app->textureHeight),c.bottom);app->request_view_render();return 0;}
         break;
     case WM_LBUTTONUP:
         if(app->draggingPan){app->draggingPan=false;ReleaseCapture();return 0;}
@@ -902,12 +966,18 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->render(true);
         return 0;
+    case WM_VIEW_RENDER:
+        app->viewRenderQueued.handled();
+        if (app->interactiveMoveResize) app->interactive_tick();
+        else app->render_view_request();
+        return 0;
     case WM_KEYDOWN:
         if (wParam == VK_SPACE) {app->spacePanning=true;return 0;}
-        if (wParam == VK_F11 && !(lParam & (1LL << 30))) { app->toggle_borderless(); return 0; }
-        if (wParam == VK_ESCAPE && app->borderless) { app->toggle_borderless(); return 0; }
+        if (wParam == VK_F11 && !(lParam & (1LL << 30)) && !(GetKeyState(VK_CONTROL)&0x8000)) { app->toggle_chrome(hcv::ChromeMode::Fullscreen); return 0; }
+        if (wParam == VK_F11 && !(lParam & (1LL << 30)) && (GetKeyState(VK_CONTROL)&0x8000)) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
+        if (wParam == VK_ESCAPE && app->chromeMode != hcv::ChromeMode::Normal) { app->toggle_chrome(app->chromeMode); return 0; }
         if (wParam == VK_F9) { app->set_video_pixels_100_percent(); return 0; }
-        if (wParam == VK_F10) { app->viewMode=(GetKeyState(VK_CONTROL)&0x8000)?hcv::ViewMode::Fill:hcv::ViewMode::Fit;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
+        if (wParam == VK_F10) { app->viewMode=(GetKeyState(VK_CONTROL)&0x8000)?hcv::ViewMode::Fill:hcv::ViewMode::Fit;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (wParam == VK_F2) {
             std::wstring snapshot = app->captureStatus + L"\r\n\r\n" + app->diagnostic;
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
@@ -927,7 +997,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if (id >= MODE_COMMAND_BASE && id < MODE_COMMAND_BASE + MAX_MENU_ITEMS) {
             app->selectedMode = id - MODE_COMMAND_BASE; app->rebuild_menus(); app->start_capture(); return 0;
         }
-        if (id == 3001) { app->toggle_borderless(); return 0; }
+        if (id == 3001) { app->toggle_chrome(hcv::ChromeMode::Fullscreen); return 0; }
+        if (id == 3009) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
         if (id == 3003) {
             app->vsyncEnabled = !app->vsyncEnabled;
             app->rebuild_menus();
@@ -941,8 +1012,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (id == 3005) { app->set_video_pixels_100_percent(); return 0; }
-        if (id == 3006) { app->viewMode=hcv::ViewMode::Fit;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
-        if (id == 3008) { app->viewMode=hcv::ViewMode::Fill;app->panX=app->panY=0;app->rebuild_menus();app->render(false);return 0; }
+        if (id == 3006) { app->viewMode=hcv::ViewMode::Fit;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
+        if (id == 3008) { app->viewMode=hcv::ViewMode::Fill;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (id == 3002) {
             app->stop_capture(); app->devices = enumerate_devices(); app->selectedDevice = 0;
             app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[0]);

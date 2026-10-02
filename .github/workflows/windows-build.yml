@@ -29,6 +29,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_borderless_restore_contract.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_ui_render_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_yuy2_two_pass_contract.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native x64 application
@@ -63,6 +65,14 @@ jobs:
           cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\viewport_math_tests.cpp /Fe:viewport_math_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\viewport_math_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\coalesced_request_tests.cpp /Fe:coalesced_request_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\coalesced_request_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /Isrc tests\chrome_mode_tests.cpp /Fe:chrome_mode_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\chrome_mode_tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload Windows x64 preview
         uses: actions/upload-artifact@v4
