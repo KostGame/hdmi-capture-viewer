@@ -830,24 +830,35 @@ struct App {
     }
 
     void restore_normal_chrome() {
-        SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
-        chromeMode = hcv::ChromeMode::Normal;
+        const auto leavingMode = savedChromeMode;
+        chromeMode = hcv::ChromeMode::Normal; // WM_NCCALCSIZE must see normal before FRAMECHANGED.
         SetMenu(window, savedMenu);
-        SetWindowPos(window, nullptr, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) {
-            ShowWindow(window, SW_MAXIMIZE);
-        } else {
-            const int width = savedWindowRect.right - savedWindowRect.left;
-            const int height = savedWindowRect.bottom - savedWindowRect.top;
-            SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE)
-                ShowWindow(window, SW_MINIMIZE);
-        }
-        if (savedChromeMode == hcv::ChromeMode::Fullscreen) {
+
+        if (leavingMode == hcv::ChromeMode::Fullscreen) {
+            SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
+            SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) {
+                ShowWindow(window, SW_MAXIMIZE);
+            } else {
+                const int width = savedWindowRect.right - savedWindowRect.left;
+                const int height = savedWindowRect.bottom - savedWindowRect.top;
+                SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE)
+                    ShowWindow(window, SW_MINIMIZE);
+            }
             viewMode=savedViewMode; panX=savedPanX; panY=savedPanY;
+        } else {
+            // BorderlessWindow never changes the native overlapped-window style
+            // or outer rectangle. Keeping both intact preserves Windows Snap /
+            // FancyZones ownership instead of turning the window into a popup.
+            if (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)) != savedStyle)
+                SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
+            SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
+
         savedMenu=nullptr;
         DrawMenuBar(window);
     }
@@ -874,9 +885,9 @@ struct App {
             savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
         }
         SetMenu(window, nullptr);
-        SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
         chromeMode = requested;
         if (requested == hcv::ChromeMode::Fullscreen) {
+            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
             MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
             SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
@@ -885,12 +896,11 @@ struct App {
             viewMode=hcv::ViewMode::Fill;
             panX=panY=0;
         } else {
-            const int width = savedWindowRect.right - savedWindowRect.left;
-            const int height = savedWindowRect.bottom - savedWindowRect.top;
-            const auto exactRect = hcv::same_outer_rect_after_chrome_change(
-                {savedWindowRect.left, savedWindowRect.top, savedWindowRect.right, savedWindowRect.bottom});
-            SetWindowPos(window, nullptr, exactRect.left, exactRect.top, width, height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            // Visual borderless only: retain the native overlapped-window style
+            // and exact outer rectangle so Windows Snap/FancyZones keep the
+            // window associated with its current zone.
+            SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
         DrawMenuBar(window);
         request_view_render();
