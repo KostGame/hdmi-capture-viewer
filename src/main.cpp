@@ -849,7 +849,7 @@ struct App {
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Auto?MF_CHECKED:0), 3010, L"Auto / whole frame (Shift+F10)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Pixel100?MF_CHECKED:0), 3005, L"100% / Pixel (F9)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fit?MF_CHECKED:0), 3006, L"Fit (F10)");
-        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fill?MF_CHECKED:0), 3008, L"Fill (Ctrl+F10)");
+        AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fill?MF_CHECKED:0), 3008, L"Fill / crop (Ctrl+F10)");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
@@ -911,7 +911,7 @@ struct App {
             L"F9  — 100% / Pixel, 1:1\n"
             L"F10 — Fit, весь кадр\n"
             L"Shift+F10 — Auto, рекомендуемый режим\n"
-            L"Ctrl+F10 — Fill, заполнить окно с обрезкой\n"
+            L"Ctrl+F10 — Fill / crop, заполнить окно с обрезкой\n"
             L"F2 — метрики\n"
             L"Esc — выход из fullscreen / auto-hide chrome\n\n"
             L"Перетаскивайте окно за внутреннюю верхнюю панель: "
@@ -1310,6 +1310,49 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+bool handle_app_shortcut(App& state, const MSG& msg) {
+    if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
+    if (msg.hwnd != state.window && !IsChild(state.window, msg.hwnd)) return false;
+
+    const bool repeated = (static_cast<unsigned long long>(msg.lParam) & (1ULL << 30)) != 0;
+    const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    if (msg.wParam == VK_F1 && !repeated) {
+        state.show_shortcuts();
+        return true;
+    }
+    if (msg.wParam == 'B' && ctrl && !repeated) {
+        state.toggle_chrome(hcv::ChromeMode::BorderlessWindow);
+        return true;
+    }
+    if (msg.wParam == VK_F11 && !repeated) {
+        state.toggle_chrome(ctrl ? hcv::ChromeMode::BorderlessWindow : hcv::ChromeMode::Fullscreen);
+        return true;
+    }
+    if (msg.wParam == VK_ESCAPE && state.chromeMode != hcv::ChromeMode::Normal) {
+        state.toggle_chrome(state.chromeMode);
+        return true;
+    }
+    if (msg.wParam == VK_F9 && !repeated) {
+        state.set_video_pixels_100_percent();
+        return true;
+    }
+    if (msg.wParam == VK_F10 && !repeated) {
+        state.viewMode = ctrl ? hcv::ViewMode::Fill : (shift ? hcv::ViewMode::Auto : hcv::ViewMode::Fit);
+        state.panX = state.panY = 0;
+        state.update_view_menu_checks();
+        state.request_view_render();
+        return true;
+    }
+    if (msg.wParam == VK_F2 && !repeated) {
+        std::wstring snapshot = state.captureStatus + L"\r\n\r\n" + state.diagnostic;
+        MessageBoxW(state.window, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
+        return true;
+    }
+    return false;
+}
+
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
@@ -1338,6 +1381,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (state.devices.empty()) state.set_status(L"No supported UVC capture device found. Connect one, then use Window > Rescan devices.");
     else if (preferredDevice < state.devices.size() || state.devices.size() == 1) state.start_capture();
     else state.set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
-    MSG msg{}; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (handle_app_shortcut(state, msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
     state.stop_capture(); app = nullptr; MFShutdown(); CoUninitialize(); return static_cast<int>(msg.wParam);
 }
