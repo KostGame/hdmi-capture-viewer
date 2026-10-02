@@ -37,7 +37,9 @@ assert "app->show_app_menu(p.x, p.y)" in source
 assert "case WM_NCHITTEST:" in source and "HTBOTTOMRIGHT" in source
 hit_test = body("    case WM_NCHITTEST:", "    case WM_MOUSEWHEEL:")
 assert "chromeMode" not in hit_test, "Resize zones stay active in every logical mode"
-assert "HTCAPTION" not in source
+assert "HTCAPTION" not in hit_test, "Video client itself must never become a caption"
+overlay_proc = body("LRESULT CALLBACK overlay_proc", "LRESULT CALLBACK window_proc")
+assert "WM_NCLBUTTONDOWN, HTCAPTION" in overlay_proc, "Only the internal title overlay initiates native Snap/FancyZones drag"
 assert "GetKeyState(VK_MENU)" in source
 assert "wParam == VK_F11" in source and "GetKeyState(VK_CONTROL)" in source
 assert "app->toggle_chrome(hcv::ChromeMode::Fullscreen)" in source

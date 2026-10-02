@@ -13,5 +13,11 @@ int main() {
     assert(fourThree.width == 1024 && fourThree.height == 576);
     auto invalid = fit_inside_aspect(800, 600, 0, 0);
     assert(invalid.width == 800 && invalid.height == 600);
+
+    using hcv::clipped_insets;
+    auto snapped = clipped_insets({-8, -8, 1928, 1088}, {0, 0, 1920, 1040});
+    assert(snapped.left == 8 && snapped.top == 8 && snapped.right == 8 && snapped.bottom == 48);
+    auto inside = clipped_insets({100, 100, 900, 700}, {0, 0, 1920, 1040});
+    assert(inside.left == 0 && inside.top == 0 && inside.right == 0 && inside.bottom == 0);
     std::cout << "WINDOW_GEOMETRY_TESTS_PASS\n";
 }

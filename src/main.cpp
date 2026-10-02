@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cwctype>
 #include <memory>
 #include <string>
 #include <thread>
@@ -154,6 +155,24 @@ std::size_t preferred_mode(const Device& d) {
     std::size_t best = 0;
     for (std::size_t i = 1; i < d.modes.size(); ++i) if (score(d.modes[i]) > score(d.modes[best])) best = i;
     return best;
+}
+
+std::wstring lowercase(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return value;
+}
+
+std::size_t preferred_device_index(const std::vector<Device>& devices) {
+    // Owner's capture card. Symbolic-link match wins over friendly-name match
+    // because other cameras can expose generic names.
+    for (std::size_t i = 0; i < devices.size(); ++i) {
+        const auto link = lowercase(devices[i].link);
+        if (link.find(L"vid_345f&pid_2131") != std::wstring::npos) return i;
+    }
+    for (std::size_t i = 0; i < devices.size(); ++i)
+        if (lowercase(devices[i].name) == L"usb3.0 video") return i;
+    return devices.size();
 }
 
 struct App {
@@ -642,8 +661,13 @@ struct App {
             const float black[] = {0,0,0,1}; ID3D11RenderTargetView* target = backBufferView.Get(); context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(backBufferView.Get(), black);
             ID3D11ShaderResourceView* presentationView = gpuYuy2Active ? yuy2RgbView.Get() : videoView.Get();
             if (presentationView && textureWidth && textureHeight && width > 0 && height > 0 && displayWidth) {
-                const auto layout=hcv::calculate_view(viewMode,static_cast<int>(width),static_cast<int>(height),static_cast<int>(displayWidth),static_cast<int>(textureHeight),panX,panY);
-                const auto& d=layout.destination; const auto& s=layout.source;
+                hcv::Insets safe{};
+                if (viewMode == hcv::ViewMode::Auto || viewMode == hcv::ViewMode::Fit) safe = visible_insets();
+                const int layoutW=std::max(1,static_cast<int>(width)-safe.left-safe.right);
+                const int layoutH=std::max(1,static_cast<int>(height)-safe.top-safe.bottom);
+                const auto layout=hcv::calculate_view(viewMode,layoutW,layoutH,static_cast<int>(displayWidth),static_cast<int>(textureHeight),panX,panY);
+                auto d=layout.destination; const auto& s=layout.source;
+                d.x += static_cast<float>(safe.left); d.y += static_cast<float>(safe.top);
                 const float l=2*d.x/width-1, r=2*(d.x+d.width)/width-1, t=1-2*d.y/height, b=1-2*(d.y+d.height)/height;
                 const Vertex vertices[]={{l,t,s.x/displayWidth,s.y/textureHeight},{r,t,(s.x+s.width)/displayWidth,s.y/textureHeight},{l,b,s.x/displayWidth,(s.y+s.height)/textureHeight},{r,b,(s.x+s.width)/displayWidth,(s.y+s.height)/textureHeight}};
                 D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -817,10 +841,11 @@ struct App {
             }
         }
         AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::Fullscreen ? MF_CHECKED : 0), 3001, L"Fullscreen (F11)");
-        AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::BorderlessWindow ? MF_CHECKED : 0), 3009, L"Borderless window (Ctrl+F11)");
+        AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::BorderlessWindow ? MF_CHECKED : 0), 3009, L"Auto-hide chrome (Ctrl+B)");
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
+        AppendMenuW(windowMenu, MF_STRING, 3011, L"Keyboard help (F1)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Auto?MF_CHECKED:0), 3010, L"Auto / whole frame (Shift+F10)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Pixel100?MF_CHECKED:0), 3005, L"100% / Pixel (F9)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Fit?MF_CHECKED:0), 3006, L"Fit (F10)");
@@ -849,6 +874,49 @@ struct App {
 
     int resize_edge() const {
         return std::max(1, static_cast<int>(std::lround(RESIZE_EDGE_96 * GetDpiForWindow(window) / 96.0)));
+    }
+
+    hcv::Insets visible_insets() const {
+        if (!window || chromeMode == hcv::ChromeMode::Fullscreen) return {};
+        RECT outer{};
+        if (!GetWindowRect(window, &outer)) return {};
+        MONITORINFO mi{sizeof(mi)};
+        if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi)) return {};
+        return hcv::clipped_insets(
+            {outer.left, outer.top, outer.right, outer.bottom},
+            {mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom});
+    }
+
+    void layout_overlay() {
+        if (!window || !chromeOverlay) return;
+        RECT client{};
+        if (!GetClientRect(window, &client)) return;
+        const auto in = visible_insets();
+        const int edge = resize_edge();
+        const int x = std::max(edge, in.left + edge);
+        const int y = std::max(edge, in.top + edge);
+        const int width = std::max(1, client.right - x - std::max(edge, in.right + edge));
+        SetWindowPos(chromeOverlay, HWND_TOP, x, y, width, overlay_height(),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        update_overlay_visibility();
+    }
+
+    void show_shortcuts() const {
+        MessageBoxW(window,
+            L"HDMI Capture Viewer\n\n"
+            L"F1  — эта памятка\n"
+            L"F11 — полноэкранный режим\n"
+            L"Ctrl+B — автоскрытие внутренней панели (режим без рамки)\n"
+            L"F9  — 100% / Pixel, 1:1\n"
+            L"F10 — Fit, весь кадр\n"
+            L"Shift+F10 — Auto, рекомендуемый режим\n"
+            L"Ctrl+F10 — Fill, заполнить окно с обрезкой\n"
+            L"F2 — метрики\n"
+            L"Esc — выход из fullscreen / auto-hide chrome\n\n"
+            L"Перетаскивайте окно за внутреннюю верхнюю панель: "
+            L"Windows Snap/FancyZones должен работать как у обычного окна.\n"
+            L"Правый клик по видео или кнопка ☰ открывают меню.",
+            L"HDMI Capture Viewer — клавиши", MB_OK | MB_ICONINFORMATION);
     }
 
     void update_overlay_visibility() {
@@ -969,25 +1037,22 @@ LRESULT CALLBACK overlay_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     case WM_MOUSEMOVE: {
         TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
         SendMessageW(GetParent(hwnd), WM_OVERLAY_HOVER, TRUE, 0);
-        if (app->draggingChrome) {
-            POINT cursor{};
-            if (GetCursorPos(&cursor)) SetWindowPos(app->window, nullptr,
-                app->chromeDragWindowOrigin.left + cursor.x - app->chromeDragCursorOrigin.x,
-                app->chromeDragWindowOrigin.top + cursor.y - app->chromeDragCursorOrigin.y,
-                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
         return 0;
     }
     case WM_MOUSELEAVE:
         SendMessageW(GetParent(hwnd), WM_OVERLAY_HOVER, FALSE, 0); return 0;
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lParam);
-        SetCapture(hwnd);
         const int action = overlay_button_at(hwnd, x);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, action);
-        if (!action) {
-            app->draggingChrome = true;
-            GetCursorPos(&app->chromeDragCursorOrigin); GetWindowRect(app->window, &app->chromeDragWindowOrigin);
+        if (action) {
+            SetCapture(hwnd);
+        } else {
+            // Use the real Windows move loop only from the internal title bar.
+            // That gives Snap Layouts/FancyZones the same drag signal as a
+            // normal caption without turning the video client into HTCAPTION.
+            ReleaseCapture();
+            SendMessageW(GetParent(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, 0);
         }
         return 0;
     }
@@ -995,15 +1060,14 @@ LRESULT CALLBACK overlay_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         const int action = static_cast<int>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         const int releasedAction = overlay_button_at(hwnd, GET_X_LPARAM(lParam));
-        const bool wasDragging = app->draggingChrome;
-        app->draggingChrome = false;
         if (GetCapture() == hwnd) ReleaseCapture();
-        if (!wasDragging && action && action == releasedAction) SendMessageW(GetParent(hwnd), WM_OVERLAY_ACTION, action, 0);
+        if (action && action == releasedAction) SendMessageW(GetParent(hwnd), WM_OVERLAY_ACTION, action, 0);
         return 0;
     }
     case WM_CANCELMODE:
     case WM_CAPTURECHANGED:
-        app->draggingChrome = false; return 0;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        return 0;
     case WM_RBUTTONUP: {
         POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
         SendMessageW(GetParent(hwnd), WM_OVERLAY_MENU, 0, MAKELPARAM(p.x, p.y)); return 0;
@@ -1020,8 +1084,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_CREATE: {
         app->window = hwnd;
         app->chromeOverlay = CreateWindowExW(0, L"HcvChromeOverlay", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-            0, app->resize_edge(), 0, app->overlay_height(), hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            0, app->resize_edge(), 1, app->overlay_height(), hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
         app->overlayPolicy.set_mode(app->chromeMode, GetTickCount64());
+        if (app->chromeOverlay) app->layout_overlay();
         SetTimer(hwnd, CHROME_HIDE_TIMER, OVERLAY_HIDE_PERIOD_MS, nullptr);
         return app->chromeOverlay ? 0 : -1;
     }
@@ -1062,13 +1127,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     }
     case WM_SIZE:
-        if (app->chromeOverlay) {
-            RECT client{}; GetClientRect(hwnd, &client);
-            const int edge = app->resize_edge();
-            const int overlayWidth = std::max(0, static_cast<int>(client.right) - 2 * edge);
-            SetWindowPos(app->chromeOverlay, HWND_TOP, edge, edge, overlayWidth,
-                app->overlay_height(), SWP_NOACTIVATE);
-        }
+        if (app->chromeOverlay) app->layout_overlay();
         if (wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
             app->resizeGate.request(LOWORD(lParam), HIWORD(lParam));
             if (!app->interactiveMoveResize) app->request_view_render();
@@ -1130,10 +1189,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_MOUSEMOVE:
         {
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
-            // PotPlayer-style auto-hide: ordinary pointer activity over the
-            // video reveals the internal chrome; inactivity hides it again.
+            // PotPlayer-style reveal zone: when auto-hide is active, moving
+            // into the top strip reveals the internal chrome. The overlay
+            // itself then keeps the policy alive while the pointer is over it.
             if (app->overlayPolicy.auto_hide()) {
-                app->overlayPolicy.reveal(GetTickCount64()); app->update_overlay_visibility();
+                const auto in = app->visible_insets();
+                const int revealBottom = in.top + app->resize_edge() + app->overlay_height() + app->resize_edge();
+                if (GET_Y_LPARAM(lParam) <= revealBottom) {
+                    app->overlayPolicy.reveal(GetTickCount64());
+                    app->update_overlay_visibility();
+                }
             }
         }
         if(app->draggingMove){POINT cursor{};if(GetCursorPos(&cursor))SetWindowPos(hwnd,nullptr,
@@ -1168,8 +1233,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_SPACE) {app->spacePanning=true;return 0;}
+        if (wParam == VK_F1) { app->show_shortcuts(); return 0; }
+        if ((wParam == 'B' || wParam == 'b') && (GetKeyState(VK_CONTROL)&0x8000) && !(lParam & (1LL << 30))) {
+            app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0;
+        }
         if (wParam == VK_F11 && !(lParam & (1LL << 30)) && !(GetKeyState(VK_CONTROL)&0x8000)) { app->toggle_chrome(hcv::ChromeMode::Fullscreen); return 0; }
-        if (wParam == VK_F11 && !(lParam & (1LL << 30)) && (GetKeyState(VK_CONTROL)&0x8000)) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
+        if (wParam == VK_F11 && !(lParam & (1LL << 30)) && (GetKeyState(VK_CONTROL)&0x8000)) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; } // compatibility alias
         if (wParam == VK_ESCAPE && app->chromeMode != hcv::ChromeMode::Normal) { app->toggle_chrome(app->chromeMode); return 0; }
         if (wParam == VK_F9) { app->set_video_pixels_100_percent(); return 0; }
         if (wParam == VK_F10) {
@@ -1216,16 +1285,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             MessageBoxW(hwnd, snapshot.c_str(), L"HDMI Capture Viewer - captured metrics", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
+        if (id == 3011) { app->show_shortcuts(); return 0; }
         if (id == 3010) { app->viewMode=hcv::ViewMode::Auto;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (id == 3005) { app->set_video_pixels_100_percent(); return 0; }
         if (id == 3006) { app->viewMode=hcv::ViewMode::Fit;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (id == 3008) { app->viewMode=hcv::ViewMode::Fill;app->panX=app->panY=0;app->update_view_menu_checks();app->request_view_render();return 0; }
         if (id == 3002) {
-            app->stop_capture(); app->devices = enumerate_devices(); app->selectedDevice = 0;
-            app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[0]);
+            app->stop_capture();
+            app->devices = enumerate_devices();
+            const auto preferred = preferred_device_index(app->devices);
+            app->selectedDevice = preferred < app->devices.size() ? preferred : 0;
+            app->selectedMode = app->devices.empty() ? 0 : preferred_mode(app->devices[app->selectedDevice]);
             app->rebuild_menus();
             if (app->devices.empty()) app->set_status(L"No capture devices found after rescan.");
-            else if (app->devices.size() == 1) app->start_capture();
+            else if (preferred < app->devices.size() || app->devices.size() == 1) app->start_capture();
             else app->set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
             return 0;
         }
@@ -1246,7 +1319,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) { CoUninitialize(); return 1; }
     App state; app = &state;
     state.devices = enumerate_devices();
-    if (!state.devices.empty()) state.selectedMode = preferred_mode(state.devices[0]);
+    const auto preferredDevice = preferred_device_index(state.devices);
+    if (!state.devices.empty()) {
+        state.selectedDevice = preferredDevice < state.devices.size() ? preferredDevice : 0;
+        state.selectedMode = preferred_mode(state.devices[state.selectedDevice]);
+    }
     WNDCLASSW overlayClass{}; overlayClass.hInstance = instance; overlayClass.lpfnWndProc = overlay_proc;
     overlayClass.lpszClassName = L"HcvChromeOverlay"; overlayClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&overlayClass);
@@ -1258,7 +1335,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
     if (state.devices.empty()) state.set_status(L"No supported UVC capture device found. Connect one, then use Window > Rescan devices.");
-    else if (state.devices.size() == 1) state.start_capture();
+    else if (preferredDevice < state.devices.size() || state.devices.size() == 1) state.start_capture();
     else state.set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
     MSG msg{}; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     state.stop_capture(); app = nullptr; MFShutdown(); CoUninitialize(); return static_cast<int>(msg.wParam);

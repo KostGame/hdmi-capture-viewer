@@ -10,6 +10,23 @@ struct IntSize {
     int height{};
 };
 
+struct IntRect {
+    int left{}, top{}, right{}, bottom{};
+};
+
+struct Insets {
+    int left{}, top{}, right{}, bottom{};
+};
+
+inline Insets clipped_insets(IntRect outer, IntRect visibleBounds) {
+    return {
+        std::max(0, visibleBounds.left - outer.left),
+        std::max(0, visibleBounds.top - outer.top),
+        std::max(0, outer.right - visibleBounds.right),
+        std::max(0, outer.bottom - visibleBounds.bottom)
+    };
+}
+
 // Return the largest rectangle with the video's aspect ratio that fits inside
 // the current client rectangle. This only shrinks one dimension, so a snapped
 // window never grows outside its assigned screen/FancyZones region.

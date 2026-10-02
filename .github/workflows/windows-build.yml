@@ -35,6 +35,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_menu_command_bounds.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_startup_ui_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build native x64 application
         shell: pwsh
         run: |
