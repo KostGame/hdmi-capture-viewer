@@ -661,8 +661,7 @@ struct App {
             const float black[] = {0,0,0,1}; ID3D11RenderTargetView* target = backBufferView.Get(); context->OMSetRenderTargets(1, &target, nullptr); context->ClearRenderTargetView(backBufferView.Get(), black);
             ID3D11ShaderResourceView* presentationView = gpuYuy2Active ? yuy2RgbView.Get() : videoView.Get();
             if (presentationView && textureWidth && textureHeight && width > 0 && height > 0 && displayWidth) {
-                hcv::Insets safe{};
-                if (viewMode == hcv::ViewMode::Auto || viewMode == hcv::ViewMode::Fit) safe = visible_insets();
+                const hcv::Insets safe = video_insets();
                 const int layoutW=std::max(1,static_cast<int>(width)-safe.left-safe.right);
                 const int layoutH=std::max(1,static_cast<int>(height)-safe.top-safe.bottom);
                 const auto layout=hcv::calculate_view(viewMode,layoutW,layoutH,static_cast<int>(displayWidth),static_cast<int>(textureHeight),panX,panY);
@@ -885,6 +884,17 @@ struct App {
         return hcv::clipped_insets(
             {outer.left, outer.top, outer.right, outer.bottom},
             {mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom});
+    }
+
+    hcv::Insets video_insets() const {
+        hcv::Insets in{};
+        if (viewMode == hcv::ViewMode::Auto || viewMode == hcv::ViewMode::Fit) in = visible_insets();
+        if (overlayPolicy.visible()) {
+            const int edge = resize_edge();
+            const int overlayY = std::max(edge, in.top + edge);
+            in.top = std::max(in.top, overlayY + overlay_height());
+        }
+        return in;
     }
 
     void layout_overlay() {

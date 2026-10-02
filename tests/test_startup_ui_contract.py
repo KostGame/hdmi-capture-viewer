@@ -12,6 +12,7 @@ for token in (
     'if (app->chromeOverlay) app->layout_overlay();',
     'void layout_overlay()',
     'hcv::Insets visible_insets() const',
+    'hcv::Insets video_insets() const',
     'viewMode == hcv::ViewMode::Auto || viewMode == hcv::ViewMode::Fit',
     "wParam == VK_F1",
     "wParam == 'B'",
@@ -39,8 +40,10 @@ assert "app->layout_overlay();" in create
 render_start = source.index("void render(bool consumeFrame")
 render_end = source.index("const auto presentStart", render_start)
 render = source[render_start:render_end]
-assert "visible_insets()" in render
+assert "video_insets()" in render
 assert "layoutW" in render and "layoutH" in render
+assert "overlayPolicy.visible()" in source
+assert "overlayY + overlay_height()" in source
 assert "d.x +=" in render and "d.y +=" in render
 
 print("STARTUP_UI_CONTRACT_PASS")
