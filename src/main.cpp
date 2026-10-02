@@ -46,10 +46,21 @@ constexpr UINT WM_NEW_FRAME = WM_APP + 1;
 constexpr UINT WM_CAPTURE_STATUS = WM_APP + 2;
 constexpr UINT WM_VIEW_RENDER = WM_APP + 3;
 constexpr UINT_PTR LIVE_MOVE_TIMER = 7;
+constexpr UINT_PTR CHROME_HIDE_TIMER = 8;
 constexpr UINT LIVE_MOVE_TIMER_PERIOD_MS = 16;
 constexpr UINT DEVICE_COMMAND_BASE = 1000;
 constexpr UINT MODE_COMMAND_BASE = 2000;
 constexpr UINT MAX_MENU_ITEMS = 500;
+constexpr UINT WM_OVERLAY_ACTION = WM_APP + 4;
+constexpr UINT WM_OVERLAY_HOVER = WM_APP + 5;
+constexpr UINT WM_OVERLAY_MENU = WM_APP + 6;
+constexpr int OVERLAY_ACTION_MENU = 1;
+constexpr int OVERLAY_ACTION_MINIMIZE = 2;
+constexpr int OVERLAY_ACTION_MAXIMIZE = 3;
+constexpr int OVERLAY_ACTION_CLOSE = 4;
+constexpr int OVERLAY_HEIGHT_96 = 40;
+constexpr int RESIZE_EDGE_96 = 8;
+constexpr UINT OVERLAY_HIDE_PERIOD_MS = 200;
 
 struct Mode {
     GUID subtype{};
@@ -147,6 +158,8 @@ std::size_t preferred_mode(const Device& d) {
 
 struct App {
     HWND window{};
+    HWND chromeOverlay{};
+    HMENU appMenu{};
     std::vector<Device> devices;
     std::size_t selectedDevice{};
     std::size_t selectedMode{};
@@ -175,6 +188,7 @@ struct App {
     std::mutex captureMetricsMutex;
     Clock::time_point lastTitleUpdate{};
     hcv::ChromeMode chromeMode{hcv::ChromeMode::Normal};
+    hcv::OverlayVisibilityPolicy overlayPolicy;
     hcv::ViewMode viewMode{hcv::ViewMode::Auto};
     float panX{}, panY{};
     bool spacePanning{}, draggingPan{}, draggingMove{};
@@ -191,12 +205,13 @@ struct App {
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     hcv::ChromeMode savedChromeMode{hcv::ChromeMode::Normal};
-    DWORD savedStyle{};
     RECT savedWindowRect{};
-    HMENU savedMenu{};
     int savedShowCmd{SW_SHOWNORMAL};
     hcv::ViewMode savedViewMode{hcv::ViewMode::Auto};
     float savedPanX{}, savedPanY{};
+    bool draggingChrome{};
+    POINT chromeDragCursorOrigin{};
+    RECT chromeDragWindowOrigin{};
 
     void request_view_render() {
         if (!window) return;
@@ -641,20 +656,29 @@ struct App {
                 ID3D11ShaderResourceView* view = presentationView; ID3D11SamplerState* smp = sampler.Get();
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
-                if(viewMode==hcv::ViewMode::Pixel100){
+                if(viewMode==hcv::ViewMode::Pixel100 || overlayPolicy.visible()){
                     const float blendFactor[4]{};
                     context->OMSetBlendState(overlayBlend.Get(), blendFactor, 0xffffffffu);
                     context->PSSetShader(overlayShader.Get(),nullptr,0);
-                    auto thumb=[&](float x,float y,float w,float h){
+                    auto overlay_quad=[&](float x,float y,float w,float h){
                         const float a=2*x/width-1,bx=2*(x+w)/width-1,ay=1-2*y/height,by=1-2*(y+h)/height;
                         const Vertex q[]={{a,ay,0,0},{bx,ay,0,0},{a,by,0,0},{bx,by,0,0}};
                         D3D11_MAPPED_SUBRESOURCE m{};if(SUCCEEDED(context->Map(vertexBuffer.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&m))){std::memcpy(m.pData,q,sizeof(q));context->Unmap(vertexBuffer.Get(),0);context->Draw(4,0);}
                     };
-                    constexpr float thickness=5;
-                    const auto sx=hcv::scrollbar_thumb(static_cast<int>(width),static_cast<int>(displayWidth),panX,static_cast<int>(width)-8);
-                    const auto sy=hcv::scrollbar_thumb(static_cast<int>(height),static_cast<int>(textureHeight),panY,static_cast<int>(height)-8);
-                    if(sx.needed)thumb(4.0f+static_cast<float>(sx.start),height-thickness-2,static_cast<float>(sx.length),thickness);
-                    if(sy.needed)thumb(width-thickness-2,4.0f+static_cast<float>(sy.start),thickness,static_cast<float>(sy.length));
+                    if(viewMode==hcv::ViewMode::Pixel100){
+                        constexpr float thickness=5;
+                        const auto sx=hcv::scrollbar_thumb(static_cast<int>(width),static_cast<int>(displayWidth),panX,static_cast<int>(width)-8);
+                        const auto sy=hcv::scrollbar_thumb(static_cast<int>(height),static_cast<int>(textureHeight),panY,static_cast<int>(height)-8);
+                        if(sx.needed)overlay_quad(4.0f+static_cast<float>(sx.start),height-thickness-2,static_cast<float>(sx.length),thickness);
+                        if(sy.needed)overlay_quad(width-thickness-2,4.0f+static_cast<float>(sy.start),thickness,static_cast<float>(sy.length));
+                    }
+                    if(overlayPolicy.visible()){
+                        const float border=std::max(1.0f, static_cast<float>(GetDpiForWindow(window))/96.0f);
+                        overlay_quad(0,0,width,border);
+                        overlay_quad(0,height-border,width,border);
+                        overlay_quad(0,0,border,height);
+                        overlay_quad(width-border,0,border,height);
+                    }
                     context->OMSetBlendState(nullptr, blendFactor, 0xffffffffu);
                 }
             }
@@ -689,6 +713,8 @@ struct App {
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
+                L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
+                L" overlay " + (overlayPolicy.visible()?L"visible":L"hidden") +
                 L"; view " + (viewMode==hcv::ViewMode::Auto?L"Auto":viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; merged view renders " + std::to_wstring(coalescedViewRenderRequests) + L"; live frames " + std::to_wstring(liveMoveFrames) +
                 L" (app metrics; NOT input-to-photon)";
             update_title();
@@ -742,15 +768,9 @@ struct App {
         RECT outer{};
         if (!GetWindowRect(window, &outer)) return;
 
-        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
-        const DWORD exStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
-        const UINT dpi = GetDpiForWindow(window);
-        RECT wanted{0, 0, videoW, videoH};
-        if (!AdjustWindowRectExForDpi(&wanted, style, GetMenu(window) != nullptr, exStyle, dpi)) return;
-
-        const int outerW = wanted.right - wanted.left;
-        const int outerH = wanted.bottom - wanted.top;
-        place_window_size_preserving_corner(outerW, outerH, outer);
+        // WM_NCCALCSIZE extends the client over the complete stable outer
+        // rectangle, so client and outer dimensions are the same contract.
+        place_window_size_preserving_corner(videoW, videoH, outer);
 
         // One bounded correction handles menu/nonclient rounding without cumulative growth.
         RECT client{}, correctedOuter{};
@@ -784,13 +804,7 @@ struct App {
     }
 
     void rebuild_menus() {
-        HMENU previous = GetMenu(window);
-        if (hcv::frameless(chromeMode)) {
-            SetMenu(window, nullptr);
-            if (previous) DestroyMenu(previous);
-            return;
-        }
-        HMENU root = CreateMenu();
+        HMENU root = CreatePopupMenu();
         HMENU deviceMenu = CreatePopupMenu(), formatMenu = CreatePopupMenu(), windowMenu = CreatePopupMenu();
         for (std::size_t i = 0; i < devices.size() && i < MAX_MENU_ITEMS; ++i)
             AppendMenuW(deviceMenu, MF_STRING | (i == selectedDevice ? MF_CHECKED : 0), DEVICE_COMMAND_BASE + static_cast<UINT>(i), devices[i].name.c_str());
@@ -814,13 +828,13 @@ struct App {
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(deviceMenu), L"Device");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(formatMenu), L"Native format");
         AppendMenuW(root, MF_POPUP, reinterpret_cast<UINT_PTR>(windowMenu), L"Window");
-        SetMenu(window, root);
+        HMENU previous = appMenu;
+        appMenu = root;
         if (previous) DestroyMenu(previous);
-        DrawMenuBar(window);
     }
 
     void update_view_menu_checks() {
-        HMENU root = GetMenu(window);
+        HMENU root = appMenu;
         HMENU windowMenu = root ? GetSubMenu(root, 2) : nullptr;
         if (!windowMenu) return;
         CheckMenuItem(windowMenu, 3010, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Auto ? MF_CHECKED : MF_UNCHECKED));
@@ -829,92 +843,187 @@ struct App {
         CheckMenuItem(windowMenu, 3008, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Fill ? MF_CHECKED : MF_UNCHECKED));
     }
 
-    void restore_normal_chrome() {
-        const auto leavingMode = savedChromeMode;
-        chromeMode = hcv::ChromeMode::Normal; // WM_NCCALCSIZE must see normal before FRAMECHANGED.
-        SetMenu(window, savedMenu);
+    int overlay_height() const {
+        return static_cast<int>(std::lround(OVERLAY_HEIGHT_96 * GetDpiForWindow(window) / 96.0));
+    }
 
-        if (leavingMode == hcv::ChromeMode::Fullscreen) {
-            SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
-            SetWindowPos(window, nullptr, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) {
-                ShowWindow(window, SW_MAXIMIZE);
-            } else {
-                const int width = savedWindowRect.right - savedWindowRect.left;
-                const int height = savedWindowRect.bottom - savedWindowRect.top;
-                SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-                if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE)
-                    ShowWindow(window, SW_MINIMIZE);
-            }
-            viewMode=savedViewMode; panX=savedPanX; panY=savedPanY;
-        } else {
-            // BorderlessWindow never changes the native overlapped-window style
-            // or outer rectangle. Keeping both intact preserves Windows Snap /
-            // FancyZones ownership instead of turning the window into a popup.
-            if (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)) != savedStyle)
-                SetWindowLongPtrW(window, GWL_STYLE, savedStyle);
-            SetWindowPos(window, nullptr, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    int resize_edge() const {
+        return std::max(1, static_cast<int>(std::lround(RESIZE_EDGE_96 * GetDpiForWindow(window) / 96.0)));
+    }
+
+    void update_overlay_visibility() {
+        if (!chromeOverlay) return;
+        const bool visible = overlayPolicy.visible();
+        if (IsWindowVisible(chromeOverlay) != visible) {
+            ShowWindow(chromeOverlay, visible ? SW_SHOWNA : SW_HIDE);
+            if (visible) InvalidateRect(chromeOverlay, nullptr, FALSE);
+            request_view_render(); // redraw the matching internal border without changing parent geometry.
         }
+    }
 
-        savedMenu=nullptr;
-        DrawMenuBar(window);
+    void show_app_menu(int x, int y) {
+        rebuild_menus();
+        if (!appMenu) return;
+        SetForegroundWindow(window);
+        const UINT command = TrackPopupMenuEx(appMenu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            x, y, window, nullptr);
+        if (command) SendMessageW(window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+        PostMessageW(window, WM_NULL, 0, 0);
+    }
+
+    void set_chrome_mode(hcv::ChromeMode mode) {
+        chromeMode = mode;
+        overlayPolicy.set_mode(mode, GetTickCount64());
+        update_overlay_visibility();
+    }
+
+    void restore_fullscreen() {
+        chromeMode = savedChromeMode;
+        overlayPolicy.set_mode(chromeMode, GetTickCount64());
+        const int width = savedWindowRect.right - savedWindowRect.left;
+        const int height = savedWindowRect.bottom - savedWindowRect.top;
+        SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) ShowWindow(window, SW_MAXIMIZE);
+        else if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE) ShowWindow(window, SW_MINIMIZE);
+        viewMode=savedViewMode; panX=savedPanX; panY=savedPanY;
+        update_overlay_visibility();
+        rebuild_menus();
+        request_view_render();
     }
 
     void toggle_chrome(hcv::ChromeMode requested) {
-        if (chromeMode == requested) {
-            restore_normal_chrome();
-            rebuild_menus();
-            request_view_render();
+        if (chromeMode == hcv::ChromeMode::Fullscreen) {
+            if (requested == hcv::ChromeMode::Fullscreen || requested == hcv::ChromeMode::BorderlessWindow) restore_fullscreen();
             return;
         }
-        // Switching modes always passes through the saved normal state. This
-        // keeps the intended pre-mode rectangle and view state deterministic.
-        if (chromeMode != hcv::ChromeMode::Normal) restore_normal_chrome();
-
-        savedChromeMode = requested;
-        savedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+        if (requested == hcv::ChromeMode::BorderlessWindow) {
+            set_chrome_mode(chromeMode == hcv::ChromeMode::BorderlessWindow ? hcv::ChromeMode::Normal : hcv::ChromeMode::BorderlessWindow);
+            return;
+        }
+        savedChromeMode = chromeMode;
         savedPlacement.length = sizeof(savedPlacement);
         GetWindowPlacement(window, &savedPlacement);
         GetWindowRect(window, &savedWindowRect);
         savedShowCmd = savedPlacement.showCmd;
-        savedMenu = GetMenu(window);
-        if (requested == hcv::ChromeMode::Fullscreen) {
-            savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
-        }
-        SetMenu(window, nullptr);
-        chromeMode = requested;
-        if (requested == hcv::ChromeMode::Fullscreen) {
-            SetWindowLongPtrW(window, GWL_STYLE, WS_POPUP | WS_THICKFRAME | WS_VISIBLE);
-            MONITORINFO mi{sizeof(mi)};
-            GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
-            SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE);
-            viewMode=hcv::ViewMode::Fill;
-            panX=panY=0;
-        } else {
-            // Visual borderless only: retain the native overlapped-window style
-            // and exact outer rectangle so Windows Snap/FancyZones keep the
-            // window associated with its current zone.
-            SetWindowPos(window, nullptr, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        }
-        DrawMenuBar(window);
+        savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
+        chromeMode = hcv::ChromeMode::Fullscreen;
+        overlayPolicy.set_mode(chromeMode, GetTickCount64());
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+            mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
+            SWP_NOACTIVATE);
+        viewMode=hcv::ViewMode::Fill;
+        panX=panY=0;
+        update_overlay_visibility();
+        rebuild_menus();
         request_view_render();
     }
 };
 
 App* app = nullptr;
 
+int overlay_button_at(HWND hwnd, int x) {
+    RECT client{}; GetClientRect(hwnd, &client);
+    const UINT dpi = GetDpiForWindow(GetParent(hwnd));
+    const int button = std::max(1, MulDiv(44, static_cast<int>(dpi), 96));
+    const int menuWidth = std::max(1, MulDiv(42, static_cast<int>(dpi), 96));
+    if (x >= client.right - button) return OVERLAY_ACTION_CLOSE;
+    if (x >= client.right - 2 * button) return OVERLAY_ACTION_MAXIMIZE;
+    if (x >= client.right - 3 * button) return OVERLAY_ACTION_MINIMIZE;
+    if (x < menuWidth) return OVERLAY_ACTION_MENU;
+    return 0;
+}
+
+LRESULT CALLBACK overlay_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps);
+        RECT r{}; GetClientRect(hwnd, &r);
+        HBRUSH bg = CreateSolidBrush(RGB(28, 30, 34)); FillRect(dc, &r, bg); DeleteObject(bg);
+        const UINT dpi = GetDpiForWindow(GetParent(hwnd));
+        auto px = [&](int value96) { return std::max(1, MulDiv(value96, static_cast<int>(dpi), 96)); };
+        const int button = px(44);
+        HPEN border = CreatePen(PS_SOLID, px(1), RGB(92, 96, 104));
+        HGDIOBJ oldPen = SelectObject(dc, border); HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(dc, 0, 0, r.right, r.bottom); SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(border);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(238, 240, 244));
+        HFONT font = CreateFontW(-px(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        RECT menuText{px(8), 0, px(38), r.bottom}; DrawTextW(dc, L"\u2630", -1, &menuText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        RECT title{px(48), 0, r.right - 3 * button, r.bottom};
+        DrawTextW(dc, L"HDMI Capture Viewer", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RECT b{r.right - 3 * button, 0, r.right - 2 * button, r.bottom};
+        DrawTextW(dc, L"_", -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        b.left += button; b.right += button;
+        DrawTextW(dc, IsZoomed(GetParent(hwnd)) ? L"\u2750" : L"\u25A1", -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        b.left += button; b.right += button;
+        DrawTextW(dc, L"\u00D7", -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, oldFont); DeleteObject(font); EndPaint(hwnd, &ps); return 0;
+    }
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
+        SendMessageW(GetParent(hwnd), WM_OVERLAY_HOVER, TRUE, 0);
+        if (app->draggingChrome) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor)) SetWindowPos(app->window, nullptr,
+                app->chromeDragWindowOrigin.left + cursor.x - app->chromeDragCursorOrigin.x,
+                app->chromeDragWindowOrigin.top + cursor.y - app->chromeDragCursorOrigin.y,
+                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        SendMessageW(GetParent(hwnd), WM_OVERLAY_HOVER, FALSE, 0); return 0;
+    case WM_LBUTTONDOWN: {
+        const int x = GET_X_LPARAM(lParam);
+        SetCapture(hwnd);
+        const int action = overlay_button_at(hwnd, x);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, action);
+        if (!action) {
+            app->draggingChrome = true;
+            GetCursorPos(&app->chromeDragCursorOrigin); GetWindowRect(app->window, &app->chromeDragWindowOrigin);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const int action = static_cast<int>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        const int releasedAction = overlay_button_at(hwnd, GET_X_LPARAM(lParam));
+        const bool wasDragging = app->draggingChrome;
+        app->draggingChrome = false;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (!wasDragging && action && action == releasedAction) SendMessageW(GetParent(hwnd), WM_OVERLAY_ACTION, action, 0);
+        return 0;
+    }
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        app->draggingChrome = false; return 0;
+    case WM_RBUTTONUP: {
+        POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
+        SendMessageW(GetParent(hwnd), WM_OVERLAY_MENU, 0, MAKELPARAM(p.x, p.y)); return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
     case WM_NCCALCSIZE:
-        if(hcv::frameless(app->chromeMode)) return 0; // Keep resize borders inside the client area.
-        break;
+        return 0; // Stable full-client custom chrome for the lifetime of this HWND.
+    case WM_CREATE: {
+        app->window = hwnd;
+        app->chromeOverlay = CreateWindowExW(0, L"HcvChromeOverlay", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            0, app->resize_edge(), 0, app->overlay_height(), hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        app->overlayPolicy.set_mode(app->chromeMode, GetTickCount64());
+        SetTimer(hwnd, CHROME_HIDE_TIMER, OVERLAY_HIDE_PERIOD_MS, nullptr);
+        return app->chromeOverlay ? 0 : -1;
+    }
     case WM_ERASEBKGND: return 1; // D3D paints the whole client: prevent white/gray flashes.
     case WM_ENTERSIZEMOVE:
         app->interactiveMoveResize = true;
@@ -937,6 +1046,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             app->interactive_tick();
             return 0;
         }
+        if (wParam == CHROME_HIDE_TIMER) {
+            app->overlayPolicy.timer(GetTickCount64());
+            app->update_overlay_visibility();
+            return 0;
+        }
         break;
     case WM_PAINT: {
         PAINTSTRUCT ps{};
@@ -947,16 +1061,21 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     }
     case WM_SIZE:
+        if (app->chromeOverlay) {
+            RECT client{}; GetClientRect(hwnd, &client);
+            const int edge = app->resize_edge();
+            SetWindowPos(app->chromeOverlay, HWND_TOP, edge, edge, std::max(0, client.right - 2 * edge),
+                app->overlay_height(), SWP_NOACTIVATE);
+        }
         if (wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
             app->resizeGate.request(LOWORD(lParam), HIWORD(lParam));
             if (!app->interactiveMoveResize) app->request_view_render();
         }
         return 0;
     case WM_NCHITTEST:
-        if(hcv::frameless(app->chromeMode)){
+        {
             POINT p{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&p);RECT c{};GetClientRect(hwnd,&c);
-            const int edge=std::max(1,static_cast<int>(std::lround(8.0*GetDpiForWindow(hwnd)/96.0)));
-            switch(hcv::borderless_hit_test(p.x,p.y,c.right,c.bottom,edge)){
+            switch(hcv::borderless_hit_test(p.x,p.y,c.right,c.bottom,app->resize_edge())){
             case hcv::ResizeEdge::Left:return HTLEFT; case hcv::ResizeEdge::Right:return HTRIGHT;
             case hcv::ResizeEdge::Top:return HTTOP; case hcv::ResizeEdge::Bottom:return HTBOTTOM;
             case hcv::ResizeEdge::TopLeft:return HTTOPLEFT; case hcv::ResizeEdge::TopRight:return HTTOPRIGHT;
@@ -964,7 +1083,27 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             default:return HTCLIENT;
             }
         }
-        return DefWindowProcW(hwnd,message,wParam,lParam);
+    case WM_MOUSELEAVE:
+        break;
+    case WM_RBUTTONUP: {
+        POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
+        app->show_app_menu(p.x, p.y); return 0;
+    }
+    case WM_OVERLAY_HOVER:
+        app->overlayPolicy.pointer_over_overlay(wParam != 0, GetTickCount64());
+        app->update_overlay_visibility(); return 0;
+    case WM_OVERLAY_MENU: {
+        POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+        app->show_app_menu(p.x, p.y); return 0;
+    }
+    case WM_OVERLAY_ACTION:
+        if (wParam == OVERLAY_ACTION_MENU) {
+            RECT r{}; GetWindowRect(app->chromeOverlay, &r); app->show_app_menu(r.left, r.bottom); return 0;
+        }
+        if (wParam == OVERLAY_ACTION_MINIMIZE) { ShowWindow(hwnd, SW_MINIMIZE); return 0; }
+        if (wParam == OVERLAY_ACTION_MAXIMIZE) { ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE); return 0; }
+        if (wParam == OVERLAY_ACTION_CLOSE) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        return 0;
     case WM_MOUSEWHEEL:
         if(app->viewMode==hcv::ViewMode::Pixel100){
             RECT c{};GetClientRect(hwnd,&c);const int delta=GET_WHEEL_DELTA_WPARAM(wParam)/WHEEL_DELTA*60*(GET_KEYSTATE_WPARAM(wParam)&MK_SHIFT?-1:1);
@@ -978,7 +1117,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     case WM_LBUTTONDOWN:
         if(app->viewMode==hcv::ViewMode::Pixel100&&app->spacePanning){app->draggingPan=true;app->dragOrigin={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};app->dragPanX=app->panX;app->dragPanY=app->panY;SetCapture(hwnd);return 0;}
-        if(app->chromeMode==hcv::ChromeMode::BorderlessWindow && (GetKeyState(VK_MENU)&0x8000)){
+        if(app->chromeMode!=hcv::ChromeMode::Normal && (GetKeyState(VK_MENU)&0x8000)){
             app->draggingMove=true;
             GetCursorPos(&app->moveCursorOrigin);
             GetWindowRect(hwnd,&app->moveWindowOrigin);
@@ -987,6 +1126,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         break;
     case WM_MOUSEMOVE:
+        {
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
+            // PotPlayer-style auto-hide: ordinary pointer activity over the
+            // video reveals the internal chrome; inactivity hides it again.
+            if (app->overlayPolicy.auto_hide()) {
+                app->overlayPolicy.reveal(GetTickCount64()); app->update_overlay_visibility();
+            }
+        }
         if(app->draggingMove){POINT cursor{};if(GetCursorPos(&cursor))SetWindowPos(hwnd,nullptr,
             app->moveWindowOrigin.left+cursor.x-app->moveCursorOrigin.x,
             app->moveWindowOrigin.top+cursor.y-app->moveCursorOrigin.y,0,0,
@@ -1077,7 +1224,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         break;
     }
-    case WM_DESTROY: KillTimer(hwnd, LIVE_MOVE_TIMER); app->stop_capture(); PostQuitMessage(0); return 0;
+    case WM_DESTROY: KillTimer(hwnd, LIVE_MOVE_TIMER); KillTimer(hwnd, CHROME_HIDE_TIMER); app->stop_capture(); if (app->appMenu) DestroyMenu(app->appMenu); app->appMenu=nullptr; PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
@@ -1093,14 +1240,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     App state; app = &state;
     state.devices = enumerate_devices();
     if (!state.devices.empty()) state.selectedMode = preferred_mode(state.devices[0]);
+    WNDCLASSW overlayClass{}; overlayClass.hInstance = instance; overlayClass.lpfnWndProc = overlay_proc;
+    overlayClass.lpszClassName = L"HcvChromeOverlay"; overlayClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&overlayClass);
     WNDCLASSW wc{}; wc.hInstance = instance; wc.lpfnWndProc = window_proc; wc.lpszClassName = L"HcvPreviewWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
-    const UINT initialDpi = GetDpiForSystem();
-    RECT rect{0,0,1920,1080};
-    AdjustWindowRectExForDpi(&rect, WS_OVERLAPPEDWINDOW, TRUE, 0, initialDpi);
     state.window = CreateWindowW(wc.lpszClassName, L"HDMI Capture Viewer", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 1920, 1080, nullptr, nullptr, instance, nullptr);
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
     if (state.devices.empty()) state.set_status(L"No supported UVC capture device found. Connect one, then use Window > Rescan devices.");
