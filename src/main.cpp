@@ -24,7 +24,9 @@
 #include <cstring>
 #include <cstdint>
 #include <cwctype>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -175,10 +177,57 @@ std::size_t preferred_device_index(const std::vector<Device>& devices) {
     return devices.size();
 }
 
+bool media_type_matches_mode(IMFMediaType* type, const Mode& mode) {
+    if (!type) return false;
+    GUID subtype{};
+    UINT32 width = 0, height = 0, fn = 0, fd = 1;
+    if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
+        FAILED(MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height)) ||
+        FAILED(MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fn, &fd)) ||
+        !fd) {
+        return false;
+    }
+    return IsEqualGUID(subtype, mode.subtype) &&
+        width == mode.width && height == mode.height &&
+        static_cast<std::uint64_t>(fn) * mode.fpsDenominator ==
+            static_cast<std::uint64_t>(mode.fpsNumerator) * fd;
+}
+
+HRESULT find_matching_native_media_type(IMFSourceReader* reader, const Mode& mode, ComPtr<IMFMediaType>& matched) {
+    if (!reader) return E_POINTER;
+    for (DWORD index = 0;; ++index) {
+        ComPtr<IMFMediaType> nativeType;
+        const HRESULT hr = reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, index, &nativeType);
+        if (hr == MF_E_NO_MORE_TYPES) return MF_E_INVALIDMEDIATYPE;
+        if (FAILED(hr)) return hr;
+        if (media_type_matches_mode(nativeType.Get(), mode)) {
+            matched = nativeType;
+            return S_OK;
+        }
+    }
+}
+
+std::wstring hresult_text(HRESULT hr) {
+    const wchar_t* name = nullptr;
+    switch (hr) {
+    case MF_E_TOPO_CODEC_NOT_FOUND: name = L"MF_E_TOPO_CODEC_NOT_FOUND"; break;
+    case MF_E_INVALIDMEDIATYPE: name = L"MF_E_INVALIDMEDIATYPE"; break;
+    case MF_E_NOT_FOUND: name = L"MF_E_NOT_FOUND"; break;
+    case E_POINTER: name = L"E_POINTER"; break;
+    default: break;
+    }
+    std::wostringstream text;
+    text << L"0x" << std::uppercase << std::hex << std::setw(8) << std::setfill(L'0')
+         << static_cast<unsigned long>(hr);
+    if (name) text << L" (" << name << L")";
+    return text.str();
+}
+
 struct App {
     HWND window{};
     HWND chromeOverlay{};
     HMENU appMenu{};
+    bool menuActive{};
     std::vector<Device> devices;
     std::size_t selectedDevice{};
     std::size_t selectedMode{};
@@ -332,19 +381,33 @@ struct App {
             if (SUCCEEDED(hr) && !source) hr = E_POINTER;
             if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), attrs.Get(), &reader);
             if (SUCCEEDED(hr) && !reader) hr = E_POINTER;
-            ComPtr<IMFMediaType> output;
-            if (SUCCEEDED(hr)) hr = MFCreateMediaType(&output);
-            if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_SUBTYPE, directYuy2 ? MFVideoFormat_YUY2 : MFVideoFormat_RGB32);
-            if (SUCCEEDED(hr)) hr = MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, mode.width, mode.height);
-            if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, mode.fpsNumerator, mode.fpsDenominator);
-            if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output.Get());
+            if (SUCCEEDED(hr) && directYuy2) {
+                // With converters disabled, give Source Reader one of its own exact
+                // native media types. Some UVC drivers reject a hand-built partial
+                // YUY2 type after the device is rebound to a different USB port.
+                ComPtr<IMFMediaType> nativeOutput;
+                hr = find_matching_native_media_type(reader.Get(), mode, nativeOutput);
+                if (SUCCEEDED(hr)) {
+                    hr = reader->SetCurrentMediaType(
+                        MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nativeOutput.Get());
+                }
+            } else if (SUCCEEDED(hr)) {
+                ComPtr<IMFMediaType> output;
+                hr = MFCreateMediaType(&output);
+                if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+                if (SUCCEEDED(hr)) hr = MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, mode.width, mode.height);
+                if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, mode.fpsNumerator, mode.fpsDenominator);
+                if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output.Get());
+            }
             if (SUCCEEDED(hr)) hr = reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
             if (FAILED(hr)) {
                 auto* message = new std::wstring(L"Could not open requested " + subtype_name(mode.subtype) + L" " +
                     std::to_wstring(mode.width) + L"x" + std::to_wstring(mode.height) + L" @ " +
-                    std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L"; Media Foundation error " + std::to_wstring(static_cast<unsigned long>(hr)) + L". Choose another listed format.");
+                    std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L"; Media Foundation error " +
+                    hresult_text(hr) + L". Choose another listed format.");
                 PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(message));
                 if (source) source->Shutdown();
                 return;
@@ -375,7 +438,7 @@ struct App {
                 hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream, &flags, &timestamp, &sample);
                 const auto sampleReadyAt = Clock::now();
                 if (FAILED(hr)) {
-                    auto* error = new std::wstring(L"Capture stopped: Media Foundation read error " + std::to_wstring(static_cast<unsigned long>(hr)));
+                    auto* error = new std::wstring(L"Capture stopped: Media Foundation read error " + hresult_text(hr));
                     PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(error));
                     break;
                 }
@@ -887,6 +950,24 @@ struct App {
             {mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom});
     }
 
+    void reveal_chrome_from_cursor(std::uint64_t nowMs) {
+        if (!window || !overlayPolicy.auto_hide() || menuActive || IsIconic(window)) return;
+        POINT cursor{};
+        RECT outer{};
+        if (!GetCursorPos(&cursor) || !GetWindowRect(window, &outer)) return;
+        const auto in = visible_insets();
+        const int left = outer.left + in.left;
+        const int top = outer.top + in.top;
+        const int right = outer.right - in.right;
+        const int bottom = outer.bottom - in.bottom;
+        if (hcv::cursor_in_reveal_strip(
+                cursor.x, cursor.y, left, top, right, bottom,
+                hcv::reveal_strip_px(static_cast<int>(GetDpiForWindow(window))))) {
+            overlayPolicy.reveal(nowMs);
+            update_overlay_visibility();
+        }
+    }
+
     void layout_overlay() {
         if (!window || !chromeOverlay) return;
         RECT client{};
@@ -934,9 +1015,15 @@ struct App {
     void show_app_menu(int x, int y) {
         rebuild_menus();
         if (!appMenu) return;
+        menuActive = true;
+        overlayPolicy.reveal(GetTickCount64());
+        update_overlay_visibility();
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenuEx(appMenu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
             x, y, window, nullptr);
+        menuActive = false;
+        overlayPolicy.reveal(GetTickCount64());
+        update_overlay_visibility();
         if (command) SendMessageW(window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
         PostMessageW(window, WM_NULL, 0, 0);
     }
@@ -1114,7 +1201,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (wParam == CHROME_HIDE_TIMER) {
-            app->overlayPolicy.timer(GetTickCount64());
+            const auto now = GetTickCount64();
+            if (app->menuActive) {
+                app->overlayPolicy.reveal(now);
+            } else {
+                app->reveal_chrome_from_cursor(now);
+                app->overlayPolicy.timer(now);
+            }
             app->update_overlay_visibility();
             return 0;
         }

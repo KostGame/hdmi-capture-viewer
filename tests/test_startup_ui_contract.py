@@ -13,6 +13,9 @@ for token in (
     'void layout_overlay()',
     'hcv::Insets visible_insets() const',
     'hcv::reveal_strip_px',
+    'hcv::cursor_in_reveal_strip',
+    'void reveal_chrome_from_cursor',
+    'menuActive',
     'viewMode == hcv::ViewMode::Auto || viewMode == hcv::ViewMode::Fit',
     "wParam == VK_F1",
     "wParam == 'B'",
@@ -47,5 +50,18 @@ assert "visibleTop + revealPx" in source
 assert "in.top + hcv::reveal_strip_px" in source
 assert "overlayY + overlay_height()" not in source
 assert "d.x +=" in render and "d.y +=" in render
+
+timer_start = source.index("if (wParam == CHROME_HIDE_TIMER)")
+timer_end = source.index("        break;", timer_start)
+timer = source[timer_start:timer_end]
+assert "reveal_chrome_from_cursor(now)" in timer
+assert "menuActive" in timer
+assert "overlayPolicy.timer(now)" in timer
+
+menu_start = source.index("void show_app_menu")
+menu_end = source.index("void set_chrome_mode", menu_start)
+menu = source[menu_start:menu_end]
+assert "menuActive = true" in menu and "menuActive = false" in menu
+assert menu.count("overlayPolicy.reveal") >= 2
 
 print("STARTUP_UI_CONTRACT_PASS")
