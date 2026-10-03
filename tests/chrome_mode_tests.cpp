@@ -10,6 +10,12 @@ int main() {
     assert(hcv::reveal_strip_px(96) == 4);
     assert(hcv::reveal_strip_px(120) == 5);
     assert(hcv::reveal_strip_px(144) == 6);
+    assert(hcv::cursor_in_reveal_strip(500, 0, 0, 0, 1920, 1080, 4));
+    assert(hcv::cursor_in_reveal_strip(500, 4, 0, 0, 1920, 1080, 4));
+    assert(!hcv::cursor_in_reveal_strip(500, 5, 0, 0, 1920, 1080, 4));
+    assert(!hcv::cursor_in_reveal_strip(-1, 0, 0, 0, 1920, 1080, 4));
+    assert(!hcv::cursor_in_reveal_strip(1920, 0, 0, 0, 1920, 1080, 4));
+    assert(!hcv::cursor_in_reveal_strip(500, 0, 0, 0, 0, 1080, 4));
     assert(hcv::chrome_state(ChromeMode::Normal) == ChromeState::NormalPinned);
     assert(hcv::chrome_state(ChromeMode::BorderlessWindow) == ChromeState::BorderlessAutoHide);
     assert(hcv::chrome_state(ChromeMode::Fullscreen) == ChromeState::FullscreenAutoHide);
