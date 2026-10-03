@@ -24,7 +24,10 @@
 #include <cstring>
 #include <cstdint>
 #include <cwctype>
+#include <iomanip>
+#include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -175,10 +178,84 @@ std::size_t preferred_device_index(const std::vector<Device>& devices) {
     return devices.size();
 }
 
+bool media_type_same_format(IMFMediaType* type, const Mode& mode, double* frameRate = nullptr) {
+    if (!type) return false;
+    GUID subtype{};
+    UINT32 width = 0, height = 0;
+    if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
+        FAILED(MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height)) ||
+        !IsEqualGUID(subtype, mode.subtype) ||
+        width != mode.width || height != mode.height) {
+        return false;
+    }
+    if (frameRate) {
+        UINT32 fn = 0, fd = 1;
+        if (SUCCEEDED(MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fn, &fd)) && fd) {
+            *frameRate = static_cast<double>(fn) / fd;
+        } else {
+            *frameRate = 0.0;
+        }
+    }
+    return true;
+}
+
+HRESULT find_matching_native_media_type(IMFSourceReader* reader, const Mode& mode, ComPtr<IMFMediaType>& matched) {
+    if (!reader) return E_POINTER;
+    ComPtr<IMFMediaType> closest;
+    double closestDistance = std::numeric_limits<double>::infinity();
+    const double requestedFps = fps(mode);
+    for (DWORD index = 0;; ++index) {
+        ComPtr<IMFMediaType> nativeType;
+        const HRESULT hr = reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, index, &nativeType);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        if (FAILED(hr)) return hr;
+        double nativeFps = 0.0;
+        if (!media_type_same_format(nativeType.Get(), mode, &nativeFps)) continue;
+        if (nativeFps > 0.0) {
+            const double distance = std::abs(nativeFps - requestedFps);
+            if (distance < 0.0001) {
+                matched = nativeType;
+                return S_OK;
+            }
+            if (distance < closestDistance) {
+                closestDistance = distance;
+                closest = nativeType;
+            }
+        } else if (!closest) {
+            // Some UVC drivers expose the same native subtype/size but omit a
+            // fixed MF_MT_FRAME_RATE on a reopened source. Preserve the full
+            // native type instead of rebuilding a partial synthetic type.
+            closest = nativeType;
+        }
+    }
+    if (closest) {
+        matched = closest;
+        return S_OK;
+    }
+    return MF_E_INVALIDMEDIATYPE;
+}
+
+std::wstring hresult_text(HRESULT hr) {
+    const wchar_t* name = nullptr;
+    switch (hr) {
+    case MF_E_TOPO_CODEC_NOT_FOUND: name = L"MF_E_TOPO_CODEC_NOT_FOUND"; break;
+    case MF_E_INVALIDMEDIATYPE: name = L"MF_E_INVALIDMEDIATYPE"; break;
+    case MF_E_NOT_FOUND: name = L"MF_E_NOT_FOUND"; break;
+    case E_POINTER: name = L"E_POINTER"; break;
+    default: break;
+    }
+    std::wostringstream text;
+    text << L"0x" << std::uppercase << std::hex << std::setw(8) << std::setfill(L'0')
+         << static_cast<unsigned long>(hr);
+    if (name) text << L" (" << name << L")";
+    return text.str();
+}
+
 struct App {
     HWND window{};
     HWND chromeOverlay{};
     HMENU appMenu{};
+    bool menuActive{};
     std::vector<Device> devices;
     std::size_t selectedDevice{};
     std::size_t selectedMode{};
@@ -314,6 +391,7 @@ struct App {
             ComPtr<IMFMediaSource> source;
             ComPtr<IMFSourceReader> reader;
             const bool directYuy2 = IsEqualGUID(mode.subtype, MFVideoFormat_YUY2);
+            const wchar_t* negotiationStage = L"create reader attributes";
             HRESULT hr = MFCreateAttributes(&attrs, 2);
             if (SUCCEEDED(hr)) hr = attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
             if (SUCCEEDED(hr) && !directYuy2) hr = attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
@@ -324,27 +402,55 @@ struct App {
             if (SUCCEEDED(hr)) hr = activateAttrs->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, device.link.c_str());
             IMFActivate** list = nullptr;
             UINT32 count = 0;
-            if (SUCCEEDED(hr)) hr = MFEnumDeviceSources(activateAttrs.Get(), &list, &count);
+            if (SUCCEEDED(hr)) {
+                negotiationStage = L"re-resolve current USB symbolic link";
+                hr = MFEnumDeviceSources(activateAttrs.Get(), &list, &count);
+            }
             if (SUCCEEDED(hr) && count == 0) hr = MF_E_NOT_FOUND;
-            if (SUCCEEDED(hr)) hr = list[0]->ActivateObject(IID_PPV_ARGS(&source));
+            if (SUCCEEDED(hr)) {
+                negotiationStage = L"activate current capture source";
+                hr = list[0]->ActivateObject(IID_PPV_ARGS(&source));
+            }
             if (list) { for (UINT32 i = 0; i < count; ++i) list[i]->Release(); CoTaskMemFree(list); }
             // Do not proceed with output negotiation until the reader exists.
             if (SUCCEEDED(hr) && !source) hr = E_POINTER;
-            if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(source.Get(), attrs.Get(), &reader);
+            if (SUCCEEDED(hr)) {
+                negotiationStage = L"create Source Reader";
+                hr = MFCreateSourceReaderFromMediaSource(source.Get(), attrs.Get(), &reader);
+            }
             if (SUCCEEDED(hr) && !reader) hr = E_POINTER;
-            ComPtr<IMFMediaType> output;
-            if (SUCCEEDED(hr)) hr = MFCreateMediaType(&output);
-            if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_SUBTYPE, directYuy2 ? MFVideoFormat_YUY2 : MFVideoFormat_RGB32);
-            if (SUCCEEDED(hr)) hr = MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, mode.width, mode.height);
-            if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, mode.fpsNumerator, mode.fpsDenominator);
-            if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output.Get());
-            if (SUCCEEDED(hr)) hr = reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+            if (SUCCEEDED(hr) && directYuy2) {
+                // With converters disabled, give Source Reader one of its own exact
+                // native media types. Some UVC drivers reject a hand-built partial
+                // YUY2 type after the device is rebound to a different USB port.
+                ComPtr<IMFMediaType> nativeOutput;
+                negotiationStage = L"find native YUY2 subtype/size";
+                hr = find_matching_native_media_type(reader.Get(), mode, nativeOutput);
+                if (SUCCEEDED(hr)) {
+                    negotiationStage = L"set native YUY2 media type";
+                    hr = reader->SetCurrentMediaType(
+                        MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nativeOutput.Get());
+                }
+            } else if (SUCCEEDED(hr)) {
+                ComPtr<IMFMediaType> output;
+                hr = MFCreateMediaType(&output);
+                if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                if (SUCCEEDED(hr)) hr = output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+                if (SUCCEEDED(hr)) hr = MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, mode.width, mode.height);
+                if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, mode.fpsNumerator, mode.fpsDenominator);
+                if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(output.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                if (SUCCEEDED(hr)) hr = reader->SetCurrentMediaType(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output.Get());
+            }
+            if (SUCCEEDED(hr)) {
+                negotiationStage = L"select video stream";
+                hr = reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+            }
             if (FAILED(hr)) {
                 auto* message = new std::wstring(L"Could not open requested " + subtype_name(mode.subtype) + L" " +
                     std::to_wstring(mode.width) + L"x" + std::to_wstring(mode.height) + L" @ " +
-                    std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L"; Media Foundation error " + std::to_wstring(static_cast<unsigned long>(hr)) + L". Choose another listed format.");
+                    std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L"; Media Foundation error " +
+                    hresult_text(hr) + L" at " + negotiationStage + L". Choose another listed format.");
                 PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(message));
                 if (source) source->Shutdown();
                 return;
@@ -352,19 +458,35 @@ struct App {
             ComPtr<IMFMediaType> negotiated;
             GUID negotiatedSubtype{};
             LONG negotiatedStride = 0;
+            UINT32 negotiatedWidth = 0, negotiatedHeight = 0, negotiatedFn = 0, negotiatedFd = 1;
+            double negotiatedFps = 0.0;
             if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &negotiated))) {
                 negotiated->GetGUID(MF_MT_SUBTYPE, &negotiatedSubtype);
+                MFGetAttributeSize(negotiated.Get(), MF_MT_FRAME_SIZE, &negotiatedWidth, &negotiatedHeight);
+                if (SUCCEEDED(MFGetAttributeRatio(negotiated.Get(), MF_MT_FRAME_RATE, &negotiatedFn, &negotiatedFd)) && negotiatedFd) {
+                    negotiatedFps = static_cast<double>(negotiatedFn) / negotiatedFd;
+                }
                 UINT32 stride = 0;
                 if (SUCCEEDED(negotiated->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride))) negotiatedStride = static_cast<LONG>(stride);
             }
-            if (directYuy2 && (!IsEqualGUID(negotiatedSubtype, MFVideoFormat_YUY2) || (mode.width & 1))) {
-                auto* error = new std::wstring(L"YUY2 GPU path requires negotiated YUY2 output and even frame width; choose another listed format.");
+            if (directYuy2 && (!IsEqualGUID(negotiatedSubtype, MFVideoFormat_YUY2) ||
+                negotiatedWidth != mode.width || negotiatedHeight != mode.height || (mode.width & 1))) {
+                auto* error = new std::wstring(L"YUY2 GPU path requires negotiated YUY2 output at the requested frame size; choose another listed format.");
+                if (!PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(error))) delete error;
+                reader.Reset(); source->Shutdown(); return;
+            }
+            if (directYuy2 && negotiatedFps > 0.0 && std::abs(negotiatedFps - fps(mode)) > 1.0) {
+                auto* error = new std::wstring(L"YUY2 GPU path negotiated " +
+                    std::to_wstring(static_cast<int>(std::lround(negotiatedFps))) +
+                    L" fps instead of requested " + std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L" fps.");
                 if (!PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(error))) delete error;
                 reader.Reset(); source->Shutdown(); return;
             }
             auto* message = new std::wstring(L"Capturing " + device.name + L"; selected advertised " + subtype_name(mode.subtype) +
                 L" " + std::to_wstring(mode.width) + L"x" + std::to_wstring(mode.height) + L" @ " +
                 std::to_wstring(static_cast<int>(std::lround(fps(mode)))) + L"; Source Reader output " + subtype_name(negotiatedSubtype) +
+                L" " + std::to_wstring(negotiatedWidth) + L"x" + std::to_wstring(negotiatedHeight) +
+                (negotiatedFps > 0.0 ? L" @ " + std::to_wstring(static_cast<int>(std::lround(negotiatedFps))) : L"") +
                 (directYuy2 ? L" (converters disabled; GPU YUY2 selected)" : L" (decoded/converted; native input subtype not confirmed"));
             if (!directYuy2) *message += L")";
             if (!PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(message))) delete message;
@@ -375,7 +497,7 @@ struct App {
                 hr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream, &flags, &timestamp, &sample);
                 const auto sampleReadyAt = Clock::now();
                 if (FAILED(hr)) {
-                    auto* error = new std::wstring(L"Capture stopped: Media Foundation read error " + std::to_wstring(static_cast<unsigned long>(hr)));
+                    auto* error = new std::wstring(L"Capture stopped: Media Foundation read error " + hresult_text(hr));
                     PostMessageW(window, WM_CAPTURE_STATUS, 0, reinterpret_cast<LPARAM>(error));
                     break;
                 }
@@ -887,6 +1009,24 @@ struct App {
             {mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom});
     }
 
+    void reveal_chrome_from_cursor(std::uint64_t nowMs) {
+        if (!window || !overlayPolicy.auto_hide() || menuActive || IsIconic(window)) return;
+        POINT cursor{};
+        RECT outer{};
+        if (!GetCursorPos(&cursor) || !GetWindowRect(window, &outer)) return;
+        const auto in = visible_insets();
+        const int left = outer.left + in.left;
+        const int top = outer.top + in.top;
+        const int right = outer.right - in.right;
+        const int bottom = outer.bottom - in.bottom;
+        if (hcv::cursor_in_reveal_strip(
+                cursor.x, cursor.y, left, top, right, bottom,
+                hcv::reveal_strip_px(static_cast<int>(GetDpiForWindow(window))))) {
+            overlayPolicy.reveal(nowMs);
+            update_overlay_visibility();
+        }
+    }
+
     void layout_overlay() {
         if (!window || !chromeOverlay) return;
         RECT client{};
@@ -934,9 +1074,15 @@ struct App {
     void show_app_menu(int x, int y) {
         rebuild_menus();
         if (!appMenu) return;
+        menuActive = true;
+        overlayPolicy.reveal(GetTickCount64());
+        update_overlay_visibility();
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenuEx(appMenu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
             x, y, window, nullptr);
+        menuActive = false;
+        overlayPolicy.reveal(GetTickCount64());
+        update_overlay_visibility();
         if (command) SendMessageW(window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
         PostMessageW(window, WM_NULL, 0, 0);
     }
@@ -1114,7 +1260,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return 0;
         }
         if (wParam == CHROME_HIDE_TIMER) {
-            app->overlayPolicy.timer(GetTickCount64());
+            const auto now = GetTickCount64();
+            if (app->menuActive) {
+                app->overlayPolicy.reveal(now);
+            } else {
+                app->reveal_chrome_from_cursor(now);
+                app->overlayPolicy.timer(now);
+            }
             app->update_overlay_visibility();
             return 0;
         }
