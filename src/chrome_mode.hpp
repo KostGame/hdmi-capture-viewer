@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdint>
-
 namespace hcv {
 
 enum class ChromeMode { Normal, BorderlessWindow, Fullscreen };
@@ -30,42 +28,11 @@ inline ChromeState chrome_state(ChromeMode mode) noexcept {
     return ChromeState::NormalPinned;
 }
 
-// Conservative placement guard, NOT an official Windows Snap-state query.
-// GetWindowRect may include invisible resize borders. A freely placed window
-// close to two work-area edges may be treated as pinned; keeping its caption
-// is safer than changing geometry unexpectedly.
-struct WorkRect { int left, top, right, bottom; };
-
-inline bool close_edge(int a, int b, int tolerance) noexcept {
-    const auto distance = static_cast<std::int64_t>(a) - b;
-    return distance >= -static_cast<std::int64_t>(tolerance) &&
-        distance <= static_cast<std::int64_t>(tolerance);
-}
-
-inline bool snap_like_placement(
-    WorkRect window, WorkRect work, int tolerance) noexcept {
-    if (tolerance < 0) return false;
-    const auto width = static_cast<std::int64_t>(window.right) - window.left;
-    const auto height = static_cast<std::int64_t>(window.bottom) - window.top;
-    const auto workWidth = static_cast<std::int64_t>(work.right) - work.left;
-    const auto workHeight = static_cast<std::int64_t>(work.bottom) - work.top;
-    if (width <= 0 || height <= 0 || workWidth <= 0 || workHeight <= 0)
-        return false;
-    // Maximize is guarded separately with IsZoomed.
-    if (width + 2LL*tolerance >= workWidth &&
-        height + 2LL*tolerance >= workHeight) return false;
-    const bool alignedX = close_edge(window.left, work.left, tolerance) ||
-        close_edge(window.right, work.right, tolerance);
-    const bool alignedY = close_edge(window.top, work.top, tolerance) ||
-        close_edge(window.bottom, work.bottom, tolerance);
-    return alignedX && alignedY;
-}
-
-inline bool keep_revealed_caption(
-    bool alreadyRevealed, bool snappedOrMaximized,
-    bool movingOrResizing, bool systemMenuActive) noexcept {
-    return alreadyRevealed &&
-        (snappedOrMaximized || movingOrResizing || systemMenuActive);
+// No screen-edge geometry or inferred Snap state. Only real Windows move/size
+// transitions pin the native caption, and only after it was revealed.
+inline bool caption_should_pin_after_window_move(
+    bool captionRevealed, bool movedOrSized) noexcept {
+    return captionRevealed && movedOrSized;
 }
 
 } // namespace hcv

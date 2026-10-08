@@ -21,6 +21,6 @@ compile_lines = [line for line in workflow.splitlines() if "src\\main.cpp" in li
 assert compile_lines, "main MSVC compile command missing"
 assert all("/utf-8" in line for line in compile_lines), "MSVC main build must use /utf-8"
 assert "эта памятка" in source
-assert "автоскрытие внутренней панели" in source
+assert "переключение системной рамки Windows" in source
 
 print("SHORTCUT_ENCODING_CONTRACT_PASS")

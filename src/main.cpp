@@ -325,6 +325,7 @@ struct App {
     Clock::time_point lastTitleUpdate{};
     hcv::ChromeMode chromeMode{hcv::ChromeMode::Normal};
     bool nativeCaptionRevealed{};
+    bool nativeCaptionPinned{};
     ULONGLONG nativeCaptionLastHoverMs{};
     hcv::ViewMode viewMode{hcv::ViewMode::Auto};
     float panX{}, panY{};
@@ -342,6 +343,8 @@ struct App {
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     hcv::ChromeMode savedChromeMode{hcv::ChromeMode::Normal};
+    bool savedNativeCaptionRevealed{};
+    bool savedNativeCaptionPinned{};
     RECT savedWindowRect{};
     int savedShowCmd{SW_SHOWNORMAL};
     hcv::ViewMode savedViewMode{hcv::ViewMode::Auto};
@@ -1055,33 +1058,15 @@ struct App {
             (chromeMode == hcv::ChromeMode::BorderlessWindow && nativeCaptionRevealed);
     }
 
-    bool snap_like_window() const {
-        if (!window || chromeMode == hcv::ChromeMode::Fullscreen) return false;
-        if (IsZoomed(window)) return true;
-        RECT outer{};
-        MONITORINFO monitor{sizeof(monitor)};
-        if (!GetWindowRect(window, &outer) ||
-            !GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor))
-            return false;
-        // GetWindowRect can include invisible resize borders (Windows 11).
-        const int dpi = static_cast<int>(GetDpiForWindow(window));
-        const int tolerance = std::max(12, MulDiv(24, dpi, 96));
-        return hcv::snap_like_placement(
-            {outer.left, outer.top, outer.right, outer.bottom},
-            {monitor.rcWork.left, monitor.rcWork.top,
-             monitor.rcWork.right, monitor.rcWork.bottom}, tolerance);
-    }
-
     void poll_native_caption(ULONGLONG nowMs) {
         if (!window || chromeMode != hcv::ChromeMode::BorderlessWindow ||
             IsIconic(window)) return;
-        // Never remove a revealed native caption from a snapped/maximized
-        // window, or while Windows owns the move/size loop or system menu.
-        // Snap detection here is deliberately a conservative placement heuristic,
-        // not a claim that Win32 provides a public Snap-state API.
-        if (hcv::keep_revealed_caption(nativeCaptionRevealed,
-                snap_like_window(), interactiveMoveResize || draggingMove ||
-                GetCapture() == window, systemMenuActive || menuActive)) {
+        // R4: never infer Snap from window rectangles. Pin a revealed real
+        // caption once Windows starts a move/size transaction. It stays
+        // visible until an explicit Ctrl+B mode change, even after unsnapping.
+        // This prevents repeated WS_CAPTION/SWP_FRAMECHANGED recalculations
+        // while the system owns mouse activation and hit tests.
+        if (nativeCaptionPinned) {
             nativeCaptionLastHoverMs = nowMs;
             return;
         }
@@ -1132,16 +1117,16 @@ struct App {
             L"HDMI Capture Viewer\n\n"
             L"F1  — эта памятка\n"
             L"F11 — полноэкранный режим\n"
-            L"Ctrl+B — автоскрытие внутренней панели (режим без рамки)\n"
+            L"Ctrl+B — переключение системной рамки Windows\n"
             L"F9  — 100% / Pixel, 1:1\n"
             L"F10 — Fit, весь кадр\n"
             L"Shift+F10 — Auto, рекомендуемый режим\n"
             L"Ctrl+F10 — Fill / crop, заполнить окно с обрезкой\n"
             L"F2 — метрики\n"
-            L"Esc — выход из fullscreen / auto-hide chrome\n\n"
+            L"Esc — выход из fullscreen / безрамочного режима\n\n"
             L"В обычном режиме окно перетаскивается за заголовок Windows. "
             L"В безрамочном режиме подведите курсор к верхней кромке.\n"
-            L"Правый клик по видео или кнопка ☰ открывают меню.",
+            L"Правый клик по видео открывает меню приложения; Alt+Space — меню Windows.",
             L"HDMI Capture Viewer — клавиши", MB_OK | MB_ICONINFORMATION);
     }
 
@@ -1179,6 +1164,7 @@ struct App {
     void set_chrome_mode(hcv::ChromeMode mode) {
         chromeMode = mode;
         nativeCaptionRevealed = false;
+        nativeCaptionPinned = false;
         nativeCaptionLastHoverMs = GetTickCount64();
         apply_native_window_style();
         request_view_render();
@@ -1186,7 +1172,8 @@ struct App {
 
     void restore_fullscreen() {
         chromeMode = savedChromeMode;
-        nativeCaptionRevealed = false;
+        nativeCaptionRevealed = savedNativeCaptionRevealed;
+        nativeCaptionPinned = savedNativeCaptionPinned;
         nativeCaptionLastHoverMs = GetTickCount64();
         apply_native_window_style();
         const int width = savedWindowRect.right - savedWindowRect.left;
@@ -1210,6 +1197,8 @@ struct App {
             return;
         }
         savedChromeMode = chromeMode;
+        savedNativeCaptionRevealed = nativeCaptionRevealed;
+        savedNativeCaptionPinned = nativeCaptionPinned;
         savedPlacement.length = sizeof(savedPlacement);
         GetWindowPlacement(window, &savedPlacement);
         GetWindowRect(window, &savedWindowRect);
@@ -1217,6 +1206,7 @@ struct App {
         savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
         chromeMode = hcv::ChromeMode::Fullscreen;
         nativeCaptionRevealed = false;
+        nativeCaptionPinned = false;
         apply_native_window_style();
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
@@ -1248,6 +1238,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_ERASEBKGND: return 1; // D3D paints the whole client: prevent white/gray flashes.
     case WM_ENTERSIZEMOVE:
         app->interactiveMoveResize = true;
+        if (app->chromeMode == hcv::ChromeMode::BorderlessWindow &&
+            app->nativeCaptionRevealed) app->nativeCaptionPinned = true;
         app->nativeCaptionLastHoverMs = GetTickCount64();
         app->lastInteractivePaint = {};
         SetTimer(hwnd, LIVE_MOVE_TIMER, LIVE_MOVE_TIMER_PERIOD_MS, nullptr);
@@ -1260,6 +1252,17 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         app->update_title(true);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
+    case WM_WINDOWPOSCHANGED: {
+        // Covers native Win+Arrow/Snap layouts that can reposition/resize
+        // without WM_ENTERSIZEMOVE. Style-only SWP_FRAMECHANGED uses
+        // SWP_NOMOVE|SWP_NOSIZE and must not pin the hover preview.
+        const auto* pos = reinterpret_cast<const WINDOWPOS*>(lParam);
+        if (pos && app->chromeMode == hcv::ChromeMode::BorderlessWindow &&
+            hcv::caption_should_pin_after_window_move(app->nativeCaptionRevealed,
+                !(pos->flags & SWP_NOMOVE) || !(pos->flags & SWP_NOSIZE)))
+            app->nativeCaptionPinned = true;
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
     case WM_MOVING:
     case WM_SIZING:
         app->interactive_tick(); // Synchronous progress even if posted frame messages stall.

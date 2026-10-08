@@ -36,7 +36,8 @@ for forbidden in ("chromeOverlay", "HcvChromeOverlay", "OVERLAY_HEIGHT_96", "ove
 
 restore = body("    void restore_fullscreen()", "    void toggle_chrome(")
 assert "chromeMode = savedChromeMode" in restore
-assert "nativeCaptionRevealed = false" in restore
+assert "nativeCaptionRevealed = savedNativeCaptionRevealed" in restore
+assert "nativeCaptionPinned = savedNativeCaptionPinned" in restore
 assert "apply_native_window_style()" in restore
 assert "savedWindowRect" in restore
 toggle = body("    void toggle_chrome(hcv::ChromeMode requested)", "\n};")
@@ -46,19 +47,20 @@ assert "SetWindowPos(window, HWND_TOP, mi.rcMonitor.left" in toggle
 assert "wParam == VK_F11" in s
 assert "id == 3009" in s
 
-# Snap safety: preserve a revealed native titlebar while window placement
-# resembles a Windows Snap layout, while the system menu is open, or while
-# Windows is tracking an interactive move/resize.
-snap = body("    bool snap_like_window() const {", "    void poll_native_caption(")
-assert "IsZoomed(window)" in snap
-assert "MONITOR_DEFAULTTONEAREST" in snap
-assert "hcv::snap_like_placement(" in snap
-assert "MulDiv(24, dpi, 96)" in snap
+# Deterministic lock after a real native move/size, not guessed Snap edges.
 poll = body("    void poll_native_caption(ULONGLONG nowMs)", "    void show_shortcuts()")
-assert "hcv::keep_revealed_caption(nativeCaptionRevealed" in poll
-assert "snap_like_window()" in poll
-assert "nativeCaptionLastHoverMs = nowMs;" in poll
-assert poll.index("keep_revealed_caption") < poll.index("nativeCaptionRevealed = false;")
+assert "if (nativeCaptionPinned)" in poll
+assert poll.index("if (nativeCaptionPinned)") < poll.index("nativeCaptionRevealed = false;")
+assert "snap_like_window()" not in s
+assert "snap_like_placement" not in s
+assert "case WM_WINDOWPOSCHANGED:" in s
+assert "hcv::caption_should_pin_after_window_move(app->nativeCaptionRevealed" in s
+assert "SWP_NOMOVE" in s and "SWP_NOSIZE" in s
+assert "case WM_ENTERSIZEMOVE:" in s and "app->nativeCaptionPinned = true" in s
 assert "case WM_ENTERMENULOOP:" in s and "case WM_EXITMENULOOP:" in s
 assert "systemMenuActive = true" in s and "systemMenuActive = false" in s
+assert "savedNativeCaptionRevealed = nativeCaptionRevealed" in toggle
+assert "savedNativeCaptionPinned = nativeCaptionPinned" in toggle
+assert "nativeCaptionPinned = false" in toggle
+assert "nativeCaptionPinned = false" in body("    void set_chrome_mode(", "    void restore_fullscreen(")
 print("NATIVE_CHROME_RESTORE_CONTRACT_PASS")
