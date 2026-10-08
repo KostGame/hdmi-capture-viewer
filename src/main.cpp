@@ -1035,10 +1035,6 @@ struct App {
         CheckMenuItem(windowMenu, 3008, MF_BYCOMMAND | (viewMode == hcv::ViewMode::Fill ? MF_CHECKED : MF_UNCHECKED));
     }
 
-    int overlay_height() const {
-        return static_cast<int>(std::lround(OVERLAY_HEIGHT_96 * GetDpiForWindow(window) / 96.0));
-    }
-
     int resize_edge() const {
         return std::max(1, static_cast<int>(std::lround(RESIZE_EDGE_96 * GetDpiForWindow(window) / 96.0)));
     }

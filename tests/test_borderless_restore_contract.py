@@ -28,7 +28,7 @@ assert "DefWindowProcW" in hit
 assert "HTBOTTOMRIGHT" in hit and "return HTCLIENT" in hit
 assert "HTCAPTION" not in hit
 
-for forbidden in ("chromeOverlay", "HcvChromeOverlay", "overlay_proc",
+for forbidden in ("chromeOverlay", "HcvChromeOverlay", "OVERLAY_HEIGHT_96", "overlay_height()", "overlay_proc",
                   "overlay_button_at", "WM_OVERLAY_", "OVERLAY_ACTION_",
                   "WM_NCLBUTTONDOWN, HTCAPTION, 0", "DrawTextW(",
                   "CreateSolidBrush(", "RegisterClassW(&overlayClass)"):
