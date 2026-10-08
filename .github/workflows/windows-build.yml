@@ -35,6 +35,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_ui_activation_nonblocking_contract.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_mouse_capture_ownership_contract.py src/main.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_yuy2_two_pass_contract.py src/main.cpp
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/test_menu_command_bounds.py src/main.cpp

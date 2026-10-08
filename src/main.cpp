@@ -317,6 +317,14 @@ struct App {
     std::uint64_t maxFrameWakeLagMs{};
     std::uint64_t maxInputQueueLagMs{};
     std::uint64_t delayedInputMessages{};
+    // UI-thread only counters, never sample cursor positions or key contents.
+    std::uint64_t focusLossWhileNativeMove{};
+    std::uint64_t focusLossPreservedSystemCapture{};
+    std::uint64_t focusLossReleasedOwnCapture{};
+    std::uint64_t mouseActivateEvents{};
+    std::uint64_t clientLeftDownEvents{};
+    std::uint64_t clientRightUpEvents{};
+    std::uint64_t menuOpenRequests{};
     std::uint64_t captureFrames{};
     Clock::time_point captureWindow = Clock::now();
     Clock::time_point previousCapture{};
@@ -906,6 +914,13 @@ struct App {
                 L"; max frame-wake queue " + std::to_wstring(maxFrameWakeLagMs) + L"ms" +
                 L"; max input queue " + std::to_wstring(maxInputQueueLagMs) + L"ms" +
                 L"/slow input " + std::to_wstring(delayedInputMessages) +
+                L"; focus loss native move " + std::to_wstring(focusLossWhileNativeMove) +
+                L"/system capture preserved " + std::to_wstring(focusLossPreservedSystemCapture) +
+                L"/own capture released " + std::to_wstring(focusLossReleasedOwnCapture) +
+                L"; mouse activation " + std::to_wstring(mouseActivateEvents) +
+                L"/left down " + std::to_wstring(clientLeftDownEvents) +
+                L"/right up " + std::to_wstring(clientRightUpEvents) +
+                L"/menu requested " + std::to_wstring(menuOpenRequests) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
                 L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
                 L" native caption " + (native_caption_active()?L"visible":L"hidden") +
@@ -1131,6 +1146,7 @@ struct App {
     }
 
     void show_app_menu(int x, int y) {
+        ++menuOpenRequests;
         rebuild_menus();
         if (!appMenu) return;
         menuActive = true;
@@ -1298,6 +1314,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             if (!app->interactiveMoveResize) app->request_view_render();
         }
         return 0;
+    case WM_MOUSEACTIVATE:
+        ++app->mouseActivateEvents;
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_NCHITTEST: {
         if (app->native_caption_active())
             return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -1328,6 +1347,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_MOUSELEAVE:
         break;
     case WM_RBUTTONUP: {
+        ++app->clientRightUpEvents;
         POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
         app->show_app_menu(p.x, p.y); return 0;
     }
@@ -1343,6 +1363,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if(wParam==VK_SPACE)app->spacePanning=false;
         return 0;
     case WM_LBUTTONDOWN:
+        ++app->clientLeftDownEvents;
         if(app->viewMode==hcv::ViewMode::Pixel100&&app->spacePanning){app->draggingPan=true;app->dragOrigin={GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};app->dragPanX=app->panX;app->dragPanY=app->panY;SetCapture(hwnd);return 0;}
         if(app->chromeMode!=hcv::ChromeMode::Normal && (GetKeyState(VK_MENU)&0x8000)){
             app->draggingMove=true;
@@ -1368,17 +1389,34 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_LBUTTONUP:
         if(app->draggingPan||app->draggingMove){app->draggingPan=false;app->draggingMove=false;if(GetCapture()==hwnd)ReleaseCapture();return 0;}
         break;
-    case WM_CANCELMODE:
+    case WM_CANCELMODE: {
+        // Release only capture acquired by our own pan or Alt-drag path.
+        // The same HWND may be held by Windows' native caption move loop.
+        const bool appOwnsCapture = app->draggingPan || app->draggingMove;
         app->draggingPan=false;app->draggingMove=false;app->spacePanning=false;
-        if(GetCapture()==hwnd)ReleaseCapture();
+        if(appOwnsCapture && GetCapture()==hwnd)ReleaseCapture();
+        // DefWindowProc(WM_CANCELMODE) itself calls ReleaseCapture, so
+        // return zero here to avoid releasing the native Windows drag.
         return 0;
+    }
     case WM_CAPTURECHANGED:
         app->draggingPan=false;app->draggingMove=false;
         break;
-    case WM_KILLFOCUS:
+    case WM_KILLFOCUS: {
+        // Do not steal the native Windows drag/resize loop's mouse capture!
+        // GetCapture()==hwnd is not proof that this app called SetCapture:
+        // Windows may temporarily capture the same HWND for caption moving.
+        const bool appOwnsCapture = app->draggingPan || app->draggingMove;
+        if(app->interactiveMoveResize) ++app->focusLossWhileNativeMove;
+        const bool heldByWindow = GetCapture()==hwnd;
+        if(heldByWindow && !appOwnsCapture) ++app->focusLossPreservedSystemCapture;
         app->draggingPan=false;app->draggingMove=false;app->spacePanning=false;
-        if(GetCapture()==hwnd)ReleaseCapture();
+        if(appOwnsCapture && heldByWindow) {
+            ++app->focusLossReleasedOwnCapture;
+            ReleaseCapture();
+        }
         break;
+    }
     case WM_NEW_FRAME: {
         const auto postedAt = app->frameWakePostedAtMs.exchange(0, std::memory_order_acq_rel);
         app->frameWakeQueued.store(false, std::memory_order_release);
