@@ -300,6 +300,7 @@ struct App {
     std::thread captureThread;
     std::atomic<bool> stopCapture{false};
     std::atomic<bool> frameWakeQueued{false};
+    std::atomic<ULONGLONG> frameWakePostedAtMs{0};
     hcv::CoalescedRequest viewRenderQueued;
     std::uint64_t coalescedViewRenderRequests{};
     hcv::LatestFrame pending;
@@ -315,6 +316,14 @@ struct App {
     double captureFps{};
     double captureP95Ms{};
     double presentMs{};
+    double maxPresentMs{};
+    double maxUiFrameDispatchMs{};
+    std::uint64_t busyNormalPresents{};
+    std::uint64_t occludedPresents{};
+    std::uint64_t failedPresents{};
+    std::uint64_t maxFrameWakeLagMs{};
+    std::uint64_t maxInputQueueLagMs{};
+    std::uint64_t delayedInputMessages{};
     std::uint64_t captureFrames{};
     Clock::time_point captureWindow = Clock::now();
     Clock::time_point previousCapture{};
@@ -357,9 +366,8 @@ struct App {
     }
 
     void render_view_request() {
-        // UI-driven view changes must never wait for VSync on the window
-        // thread. The next normal capture frame returns to the user's VSync
-        // preference, while this immediate update stays responsive.
+        // UI-driven view changes render immediately. All frame presentations
+        // now refuse to wait for DXGI backpressure on the Win32 input thread.
         render(true, true, true);
     }
 
@@ -584,8 +592,11 @@ struct App {
                     pending.publish(std::move(frame));
                     // Keep the Win32 message queue bounded as well as the frame mailbox.
                     if (!frameWakeQueued.exchange(true, std::memory_order_acq_rel)) {
-                        if (!PostMessageW(window, WM_NEW_FRAME, 0, 0))
+                        frameWakePostedAtMs.store(GetTickCount64(), std::memory_order_release);
+                        if (!PostMessageW(window, WM_NEW_FRAME, 0, 0)) {
+                            frameWakePostedAtMs.store(0, std::memory_order_release);
                             frameWakeQueued.store(false, std::memory_order_release);
+                        }
                     }
                 }
                 buffer->Unlock();
@@ -855,15 +866,28 @@ struct App {
                 }
             }
             const auto presentStart = Clock::now();
-            // Waiting for VSync inside Windows' modal drag loop stalls mouse
-            // tracking. Keep the user's VSync preference for normal playback.
-            const bool nonblockingPresent = interactiveMoveResize || draggingMove || uiImmediate;
+            // All capture frames arrive through the same Win32 thread that
+            // handles activation, hit tests, and caption dragging. Never let
+            // DXGI backpressure wait on that thread, even before WM_ENTERSIZEMOVE.
+            // Keep the user's sync preference; a busy present is skipped and
+            // the next mailbox frame is newer, not queued behind it.
+            const bool interactivePresent = interactiveMoveResize || draggingMove || uiImmediate;
             const HRESULT presentResult = swapChain->Present(
-                nonblockingPresent ? 0u : (vsyncEnabled ? 1u : 0u),
-                nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
+                interactivePresent ? 0u : (vsyncEnabled ? 1u : 0u),
+                DXGI_PRESENT_DO_NOT_WAIT);
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
-            if (nonblockingPresent && presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
-                ++skippedInteractivePresent;
+            maxPresentMs = std::max(maxPresentMs, presentMs);
+            if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
+                if (interactivePresent) ++skippedInteractivePresent;
+                else ++busyNormalPresents;
+                return;
+            }
+            if (presentResult == DXGI_STATUS_OCCLUDED) {
+                ++occludedPresents;
+                return;
+            }
+            if (FAILED(presentResult)) {
+                ++failedPresents;
                 return;
             }
         }
@@ -884,6 +908,14 @@ struct App {
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
+                L"/busy normal presents " + std::to_wstring(busyNormalPresents) +
+                L"/occluded presents " + std::to_wstring(occludedPresents) +
+                L"/failed presents " + std::to_wstring(failedPresents) +
+                L"; max Present " + std::to_wstring(static_cast<int>(maxPresentMs)) + L"ms" +
+                L"/max UI frame dispatch " + std::to_wstring(static_cast<int>(maxUiFrameDispatchMs)) + L"ms" +
+                L"; max frame-wake queue " + std::to_wstring(maxFrameWakeLagMs) + L"ms" +
+                L"; max input queue " + std::to_wstring(maxInputQueueLagMs) + L"ms" +
+                L"/slow input " + std::to_wstring(delayedInputMessages) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
                 L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
                 L" overlay " + (overlayPolicy.visible()?L"visible":L"hidden") +
@@ -1414,11 +1446,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         app->draggingPan=false;app->draggingMove=false;app->spacePanning=false;
         if(GetCapture()==hwnd)ReleaseCapture();
         break;
-    case WM_NEW_FRAME:
+    case WM_NEW_FRAME: {
+        const auto postedAt = app->frameWakePostedAtMs.exchange(0, std::memory_order_acq_rel);
         app->frameWakeQueued.store(false, std::memory_order_release);
+        if (postedAt) {
+            const auto queueWait = GetTickCount64() - postedAt;
+            app->maxFrameWakeLagMs = std::max(app->maxFrameWakeLagMs, queueWait);
+        }
+        const auto handlerStart = Clock::now();
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->render(true);
+        app->maxUiFrameDispatchMs = std::max(app->maxUiFrameDispatchMs,
+            std::chrono::duration<double, std::milli>(Clock::now() - handlerStart).count());
         return 0;
+    }
     case WM_VIEW_RENDER:
         app->viewRenderQueued.handled();
         if (app->interactiveMoveResize) app->interactive_tick();
@@ -1575,6 +1616,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     else state.set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // This is queue age, not mouse-to-visible-frame latency. No mouse
+        // coordinates, keys, or raw input contents are recorded.
+        if (msg.message == WM_LBUTTONDOWN || msg.message == WM_NCLBUTTONDOWN ||
+            msg.message == WM_MOUSEMOVE || msg.message == WM_NCMOUSEMOVE) {
+            const DWORD age = GetTickCount() - msg.time;
+            if (age < 60'000) {
+                state.maxInputQueueLagMs = std::max(
+                    state.maxInputQueueLagMs, static_cast<std::uint64_t>(age));
+                if (age >= 250) ++state.delayedInputMessages;
+            }
+        }
         if (handle_app_shortcut(state, msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
