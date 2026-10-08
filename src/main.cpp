@@ -755,6 +755,12 @@ struct App {
     }
 
     void render(bool consumeFrame, bool forceWithoutFrame = false, bool uiImmediate = false) {
+#ifdef HCV005_NO_VIDEO
+        // Diagnostic control B: preserve the original HWND, custom chrome and
+        // message handlers, but completely bypass D3D/capture processing.
+        (void)consumeFrame; (void)forceWithoutFrame; (void)uiImmediate;
+        return;
+#endif
         if (!window || IsIconic(window)) return;
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
         auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
@@ -1570,9 +1576,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         CW_USEDEFAULT, CW_USEDEFAULT, 1920, 1080, nullptr, nullptr, instance, nullptr);
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
+#ifdef HCV005_NO_VIDEO
+    state.set_status(L"HCV005 diagnostic: capture and D3D rendering intentionally disabled.");
+#else
     if (state.devices.empty()) state.set_status(L"No supported UVC capture device found. Connect one, then use Window > Rescan devices.");
     else if (preferredDevice < state.devices.size() || state.devices.size() == 1) state.start_capture();
     else state.set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
+#endif
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (handle_app_shortcut(state, msg)) continue;
