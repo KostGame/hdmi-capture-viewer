@@ -300,6 +300,7 @@ struct App {
     std::thread captureThread;
     std::atomic<bool> stopCapture{false};
     std::atomic<bool> frameWakeQueued{false};
+    std::atomic<ULONGLONG> frameWakePostedAtMs{0};
     hcv::CoalescedRequest viewRenderQueued;
     std::uint64_t coalescedViewRenderRequests{};
     hcv::LatestFrame pending;
@@ -315,6 +316,14 @@ struct App {
     double captureFps{};
     double captureP95Ms{};
     double presentMs{};
+    double maxPresentMs{};
+    double maxUiFrameDispatchMs{};
+    std::uint64_t busyNormalPresents{};
+    std::uint64_t occludedPresents{};
+    std::uint64_t failedPresents{};
+    std::uint64_t maxFrameWakeLagMs{};
+    std::uint64_t maxInputQueueLagMs{};
+    std::uint64_t delayedInputMessages{};
     std::uint64_t captureFrames{};
     Clock::time_point captureWindow = Clock::now();
     Clock::time_point previousCapture{};
@@ -357,9 +366,8 @@ struct App {
     }
 
     void render_view_request() {
-        // UI-driven view changes must never wait for VSync on the window
-        // thread. The next normal capture frame returns to the user's VSync
-        // preference, while this immediate update stays responsive.
+        // UI-driven view changes render immediately. All frame presentations
+        // now refuse to wait for DXGI backpressure on the Win32 input thread.
         render(true, true, true);
     }
 
@@ -584,8 +592,11 @@ struct App {
                     pending.publish(std::move(frame));
                     // Keep the Win32 message queue bounded as well as the frame mailbox.
                     if (!frameWakeQueued.exchange(true, std::memory_order_acq_rel)) {
-                        if (!PostMessageW(window, WM_NEW_FRAME, 0, 0))
+                        frameWakePostedAtMs.store(GetTickCount64(), std::memory_order_release);
+                        if (!PostMessageW(window, WM_NEW_FRAME, 0, 0)) {
+                            frameWakePostedAtMs.store(0, std::memory_order_release);
                             frameWakeQueued.store(false, std::memory_order_release);
+                        }
                     }
                 }
                 buffer->Unlock();
@@ -828,7 +839,7 @@ struct App {
                 ID3D11ShaderResourceView* view = presentationView; ID3D11SamplerState* smp = sampler.Get();
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
-                if(viewMode==hcv::ViewMode::Pixel100 || overlayPolicy.visible()){
+                if(viewMode==hcv::ViewMode::Pixel100 || (chromeMode!=hcv::ChromeMode::Normal && overlayPolicy.visible())){
                     const float blendFactor[4]{};
                     context->OMSetBlendState(overlayBlend.Get(), blendFactor, 0xffffffffu);
                     context->PSSetShader(overlayShader.Get(),nullptr,0);
@@ -844,7 +855,7 @@ struct App {
                         if(sx.needed)overlay_quad(4.0f+static_cast<float>(sx.start),height-thickness-2,static_cast<float>(sx.length),thickness);
                         if(sy.needed)overlay_quad(width-thickness-2,4.0f+static_cast<float>(sy.start),thickness,static_cast<float>(sy.length));
                     }
-                    if(overlayPolicy.visible()){
+                    if(chromeMode!=hcv::ChromeMode::Normal && overlayPolicy.visible()){
                         const float border=std::max(1.0f, static_cast<float>(GetDpiForWindow(window))/96.0f);
                         overlay_quad(0,0,width,border);
                         overlay_quad(0,height-border,width,border);
@@ -855,15 +866,28 @@ struct App {
                 }
             }
             const auto presentStart = Clock::now();
-            // Waiting for VSync inside Windows' modal drag loop stalls mouse
-            // tracking. Keep the user's VSync preference for normal playback.
-            const bool nonblockingPresent = interactiveMoveResize || draggingMove || uiImmediate;
+            // All capture frames arrive through the same Win32 thread that
+            // handles activation, hit tests, and caption dragging. Never let
+            // DXGI backpressure wait on that thread, even before WM_ENTERSIZEMOVE.
+            // Keep the user's sync preference; a busy present is skipped and
+            // the next mailbox frame is newer, not queued behind it.
+            const bool interactivePresent = interactiveMoveResize || draggingMove || uiImmediate;
             const HRESULT presentResult = swapChain->Present(
-                nonblockingPresent ? 0u : (vsyncEnabled ? 1u : 0u),
-                nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
+                interactivePresent ? 0u : (vsyncEnabled ? 1u : 0u),
+                DXGI_PRESENT_DO_NOT_WAIT);
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
-            if (nonblockingPresent && presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
-                ++skippedInteractivePresent;
+            maxPresentMs = std::max(maxPresentMs, presentMs);
+            if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
+                if (interactivePresent) ++skippedInteractivePresent;
+                else ++busyNormalPresents;
+                return;
+            }
+            if (presentResult == DXGI_STATUS_OCCLUDED) {
+                ++occludedPresents;
+                return;
+            }
+            if (FAILED(presentResult)) {
+                ++failedPresents;
                 return;
             }
         }
@@ -884,6 +908,14 @@ struct App {
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
+                L"/busy normal presents " + std::to_wstring(busyNormalPresents) +
+                L"/occluded presents " + std::to_wstring(occludedPresents) +
+                L"/failed presents " + std::to_wstring(failedPresents) +
+                L"; max Present " + std::to_wstring(static_cast<int>(maxPresentMs)) + L"ms" +
+                L"/max UI frame dispatch " + std::to_wstring(static_cast<int>(maxUiFrameDispatchMs)) + L"ms" +
+                L"; max frame-wake queue " + std::to_wstring(maxFrameWakeLagMs) + L"ms" +
+                L"; max input queue " + std::to_wstring(maxInputQueueLagMs) + L"ms" +
+                L"/slow input " + std::to_wstring(delayedInputMessages) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
                 L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
                 L" overlay " + (overlayPolicy.visible()?L"visible":L"hidden") +
@@ -1064,7 +1096,7 @@ struct App {
         const int clientRight = static_cast<int>(client.right);
         const int width = std::max(1, clientRight - x - std::max(edge, in.right + edge));
         SetWindowPos(chromeOverlay, HWND_TOP, x, y, width, overlay_height(),
-            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            SWP_NOACTIVATE);
         update_overlay_visibility();
     }
 
@@ -1080,15 +1112,17 @@ struct App {
             L"Ctrl+F10 — Fill / crop, заполнить окно с обрезкой\n"
             L"F2 — метрики\n"
             L"Esc — выход из fullscreen / auto-hide chrome\n\n"
-            L"Перетаскивайте окно за внутреннюю верхнюю панель: "
-            L"Windows Snap/FancyZones должен работать как у обычного окна.\n"
+            L"В обычном режиме окно перетаскивается за заголовок Windows. "
+            L"В безрамочном режиме подведите курсор к верхней кромке.\n"
             L"Правый клик по видео или кнопка ☰ открывают меню.",
             L"HDMI Capture Viewer — клавиши", MB_OK | MB_ICONINFORMATION);
     }
 
     void update_overlay_visibility() {
         if (!chromeOverlay) return;
-        const bool visible = overlayPolicy.visible();
+        // Native Windows owns the titlebar in Normal mode. The child chrome
+        // exists only in frameless/fullscreen presentation modes.
+        const bool visible = chromeMode != hcv::ChromeMode::Normal && overlayPolicy.visible();
         const bool currentlyVisible = IsWindowVisible(chromeOverlay) != FALSE;
         if (currentlyVisible != visible) {
             ShowWindow(chromeOverlay, visible ? SW_SHOWNA : SW_HIDE);
@@ -1113,15 +1147,40 @@ struct App {
         PostMessageW(window, WM_NULL, 0, 0);
     }
 
+    void apply_native_window_style() {
+        if (!window) return;
+        const LONG_PTR current = GetWindowLongPtrW(window, GWL_STYLE);
+        // Keep WS_THICKFRAME, WS_SYSMENU and min/max flags: Windows owns
+        // resizing, foreground activation, Snap and system commands.
+        const LONG_PTR desired = chromeMode == hcv::ChromeMode::Normal
+            ? (current | WS_CAPTION)
+            : (current & ~static_cast<LONG_PTR>(WS_CAPTION));
+        if (desired != current) {
+            SetLastError(ERROR_SUCCESS);
+            const LONG_PTR old = SetWindowLongPtrW(window, GWL_STYLE, desired);
+            if (old == 0 && GetLastError() != ERROR_SUCCESS) {
+                SetWindowLongPtrW(window, GWL_STYLE, current);
+                return;
+            }
+        }
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+            SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        layout_overlay();
+    }
+
     void set_chrome_mode(hcv::ChromeMode mode) {
         chromeMode = mode;
         overlayPolicy.set_mode(mode, GetTickCount64());
+        apply_native_window_style();
         update_overlay_visibility();
+        request_view_render();
     }
 
     void restore_fullscreen() {
         chromeMode = savedChromeMode;
         overlayPolicy.set_mode(chromeMode, GetTickCount64());
+        apply_native_window_style();
         const int width = savedWindowRect.right - savedWindowRect.left;
         const int height = savedWindowRect.bottom - savedWindowRect.top;
         SetWindowPos(window, nullptr, savedWindowRect.left, savedWindowRect.top, width, height,
@@ -1151,6 +1210,7 @@ struct App {
         savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
         chromeMode = hcv::ChromeMode::Fullscreen;
         overlayPolicy.set_mode(chromeMode, GetTickCount64());
+        apply_native_window_style();
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
         SetWindowPos(window, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
@@ -1181,6 +1241,14 @@ int overlay_button_at(HWND hwnd, int x) {
 LRESULT CALLBACK overlay_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
+    case WM_NCHITTEST: {
+        // The visual title is a child HWND, but its empty drag area must
+        // hit-test as native caption on the parent HWND. Keep the menu and
+        // caption buttons interactive inside this child.
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &point);
+        return overlay_button_at(hwnd, point.x) ? HTCLIENT : HTTRANSPARENT;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps);
@@ -1218,15 +1286,9 @@ LRESULT CALLBACK overlay_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         const int x = GET_X_LPARAM(lParam);
         const int action = overlay_button_at(hwnd, x);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, action);
-        if (action) {
-            SetCapture(hwnd);
-        } else {
-            // Use the real Windows move loop only from the internal title bar.
-            // That gives Snap Layouts/FancyZones the same drag signal as a
-            // normal caption without turning the video client into HTCAPTION.
-            ReleaseCapture();
-            SendMessageW(GetParent(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, 0);
-        }
+        if (action) SetCapture(hwnd);
+        // Non-button title clicks are handled by the parent HTCAPTION.
+        // No synthetic WM_NCLBUTTONDOWN or zero screen coordinates.
         return 0;
     }
     case WM_LBUTTONUP: {
@@ -1253,7 +1315,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
     case WM_NCCALCSIZE:
-        return 0; // Stable full-client custom chrome for the lifetime of this HWND.
+        // Normal mode must retain the true Windows caption and frame.
+        // Frameless and fullscreen modes own the full client rectangle.
+        if (app->chromeMode != hcv::ChromeMode::Normal && wParam) return 0;
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_CREATE: {
         app->window = hwnd;
         app->chromeOverlay = CreateWindowExW(0, L"HcvChromeOverlay", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
@@ -1312,23 +1377,56 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             if (!app->interactiveMoveResize) app->request_view_render();
         }
         return 0;
-    case WM_NCHITTEST:
-        {
-            POINT p{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};ScreenToClient(hwnd,&p);RECT c{};GetClientRect(hwnd,&c);
-            switch(hcv::borderless_hit_test(p.x,p.y,c.right,c.bottom,app->resize_edge())){
-            case hcv::ResizeEdge::Left:return HTLEFT; case hcv::ResizeEdge::Right:return HTRIGHT;
-            case hcv::ResizeEdge::Top:return HTTOP; case hcv::ResizeEdge::Bottom:return HTBOTTOM;
-            case hcv::ResizeEdge::TopLeft:return HTTOPLEFT; case hcv::ResizeEdge::TopRight:return HTTOPRIGHT;
-            case hcv::ResizeEdge::BottomLeft:return HTBOTTOMLEFT; case hcv::ResizeEdge::BottomRight:return HTBOTTOMRIGHT;
-            default:return HTCLIENT;
+    case WM_NCHITTEST: {
+        if (app->chromeMode == hcv::ChromeMode::Normal)
+            return DefWindowProcW(hwnd, message, wParam, lParam);
+
+        // Window-owned non-client hit test. Windows (not a child control)
+        // starts the move/size modal loop with real cursor coordinates.
+        POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        POINT client = screen;
+        ScreenToClient(hwnd, &client);
+        RECT bounds{};
+        GetClientRect(hwnd, &bounds);
+        if (app->chromeMode != hcv::ChromeMode::Fullscreen && !IsZoomed(hwnd)) {
+            switch (hcv::borderless_hit_test(client.x, client.y,
+                bounds.right, bounds.bottom, app->resize_edge())) {
+            case hcv::ResizeEdge::Left: return HTLEFT;
+            case hcv::ResizeEdge::Right: return HTRIGHT;
+            case hcv::ResizeEdge::Top: return HTTOP;
+            case hcv::ResizeEdge::Bottom: return HTBOTTOM;
+            case hcv::ResizeEdge::TopLeft: return HTTOPLEFT;
+            case hcv::ResizeEdge::TopRight: return HTTOPRIGHT;
+            case hcv::ResizeEdge::BottomLeft: return HTBOTTOMLEFT;
+            case hcv::ResizeEdge::BottomRight: return HTBOTTOMRIGHT;
+            default: break;
             }
         }
+        if (app->chromeMode == hcv::ChromeMode::BorderlessWindow &&
+            app->chromeOverlay && IsWindowVisible(app->chromeOverlay)) {
+            RECT titleRect{};
+            if (GetWindowRect(app->chromeOverlay, &titleRect) &&
+                PtInRect(&titleRect, screen)) {
+                POINT titlePoint = screen;
+                ScreenToClient(app->chromeOverlay, &titlePoint);
+                if (!overlay_button_at(app->chromeOverlay, titlePoint.x))
+                    return HTCAPTION;
+            }
+        }
+        return HTCLIENT;
+    }
     case WM_MOUSELEAVE:
         break;
     case WM_RBUTTONUP: {
         POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
         app->show_app_menu(p.x, p.y); return 0;
     }
+    case WM_NCRBUTTONUP:
+        if (wParam == HTCAPTION && app->chromeMode == hcv::ChromeMode::BorderlessWindow) {
+            app->show_app_menu(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        }
+        break;
     case WM_OVERLAY_HOVER:
         app->overlayPolicy.pointer_over_overlay(wParam != 0, GetTickCount64());
         app->update_overlay_visibility(); return 0;
@@ -1414,11 +1512,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         app->draggingPan=false;app->draggingMove=false;app->spacePanning=false;
         if(GetCapture()==hwnd)ReleaseCapture();
         break;
-    case WM_NEW_FRAME:
+    case WM_NEW_FRAME: {
+        const auto postedAt = app->frameWakePostedAtMs.exchange(0, std::memory_order_acq_rel);
         app->frameWakeQueued.store(false, std::memory_order_release);
+        if (postedAt) {
+            const auto queueWait = GetTickCount64() - postedAt;
+            app->maxFrameWakeLagMs = std::max(app->maxFrameWakeLagMs, queueWait);
+        }
+        const auto handlerStart = Clock::now();
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->render(true);
+        app->maxUiFrameDispatchMs = std::max(app->maxUiFrameDispatchMs,
+            std::chrono::duration<double, std::milli>(Clock::now() - handlerStart).count());
         return 0;
+    }
     case WM_VIEW_RENDER:
         app->viewRenderQueued.handled();
         if (app->interactiveMoveResize) app->interactive_tick();
@@ -1575,6 +1682,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     else state.set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // This is queue age, not mouse-to-visible-frame latency. No mouse
+        // coordinates, keys, or raw input contents are recorded.
+        if (msg.message == WM_LBUTTONDOWN || msg.message == WM_NCLBUTTONDOWN ||
+            msg.message == WM_MOUSEMOVE || msg.message == WM_NCMOUSEMOVE) {
+            const DWORD age = GetTickCount() - msg.time;
+            if (age < 60'000) {
+                state.maxInputQueueLagMs = std::max(
+                    state.maxInputQueueLagMs, static_cast<std::uint64_t>(age));
+                if (age >= 250) ++state.delayedInputMessages;
+            }
+        }
         if (handle_app_shortcut(state, msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);

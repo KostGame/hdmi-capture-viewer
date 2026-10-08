@@ -21,17 +21,20 @@ for token in (
     "wParam == 'B'",
     'Keyboard help (F1)',
     'Auto-hide chrome (Ctrl+B)',
-    'WM_NCLBUTTONDOWN, HTCAPTION',
+    'SWP_FRAMECHANGED',
     'WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN',
     'case WM_NCMOUSEMOVE:',
 ):
     assert token in source, f"missing startup/UI contract: {token}"
 
-# Native caption semantics may only be initiated from the internal child overlay,
-# never from the video client's WM_NCHITTEST.
-hit_start = source.index("    case WM_NCHITTEST:")
-hit_end = source.index("    case WM_MOUSEWHEEL:", hit_start)
-assert "HTCAPTION" not in source[hit_start:hit_end]
+# Normal mode uses the true Windows caption; borderless mode returns HTCAPTION
+# from the top-level window. The child never synthesizes mouse messages.
+main = source[source.index("LRESULT CALLBACK window_proc"):]
+hit_start = main.index("    case WM_NCHITTEST:")
+hit_end = main.index("    case WM_MOUSELEAVE:", hit_start)
+assert "HTCAPTION" in main[hit_start:hit_end]
+assert "DefWindowProcW(hwnd, message, wParam, lParam)" in main[hit_start:hit_end]
+assert "WM_NCLBUTTONDOWN, HTCAPTION, 0" not in source
 
 # The child must be laid out immediately at WM_CREATE, not wait for a later resize.
 create_start = source.index("    case WM_CREATE:")

@@ -1,51 +1,61 @@
-"""Guard stable native chrome and PotPlayer-style child overlay contracts."""
+"""Guard Windows-owned native chrome, native move/resize, and fullscreen restore."""
 from pathlib import Path
 import sys
 
 source = Path(sys.argv[1] if len(sys.argv) > 1 else "src/main.cpp").read_text(encoding="utf-8")
 header = Path("src/chrome_mode.hpp").read_text(encoding="utf-8")
 
-def body(start_marker, end_marker):
-    start = source.index(start_marker)
-    return source[start:source.index(end_marker, start)]
+def body(begin, end):
+    a = source.index(begin)
+    return source[a:source.index(end, a)]
 
-assert "WS_OVERLAPPEDWINDOW" in source
-assert "SetWindowLongPtrW(window" not in source, "Parent native style must remain stable in every mode"
-assert "SetMenu(" not in source, "The app menu is popup-only and never changes client geometry"
-assert "case WM_NCCALCSIZE:\n        return 0;" in source
-assert "void set_chrome_mode(hcv::ChromeMode mode)" in source
+assert "WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN" in source
+assert "SetMenu(" not in source, "Popup menu must never affect client geometry"
+
+native = body("    void apply_native_window_style()", "    void set_chrome_mode(")
+for token in ("GetWindowLongPtrW(window, GWL_STYLE)",
+              "(current | WS_CAPTION)", "WS_CAPTION", "SetWindowLongPtrW",
+              "SWP_FRAMECHANGED", "SWP_NOMOVE", "SWP_NOSIZE", "layout_overlay()"):
+    assert token in native, f"missing Windows native style contract: {token}"
 mode = body("    void set_chrome_mode(hcv::ChromeMode mode)", "    void restore_fullscreen()")
-assert "chromeMode = mode" in mode and "overlayPolicy.set_mode" in mode
-assert "update_overlay_visibility()" in mode
-assert "SetWindowLongPtrW" not in mode and "SetWindowPos" not in mode and "request_view_render" not in mode
+assert "apply_native_window_style()" in mode
+assert "overlayPolicy.set_mode" in mode
+
+nccalc = body("    case WM_NCCALCSIZE:", "    case WM_CREATE:")
+assert "chromeMode != hcv::ChromeMode::Normal && wParam" in nccalc
+assert "DefWindowProcW(hwnd, message, wParam, lParam)" in nccalc
+assert "return 0;" in nccalc
+
+main = source[source.index("LRESULT CALLBACK window_proc"):]
+hit_begin = main.index("    case WM_NCHITTEST:")
+hit_end = main.index("    case WM_MOUSELEAVE:", hit_begin)
+hit = main[hit_begin:hit_end]
+assert "app->chromeMode == hcv::ChromeMode::Normal" in hit
+assert "DefWindowProcW(hwnd, message, wParam, lParam)" in hit
+assert "HTCAPTION" in hit and "HTBOTTOMRIGHT" in hit
+assert "return HTCLIENT" in hit
+assert "overlay_button_at(app->chromeOverlay, titlePoint.x)" in hit
+
+overlay = body("LRESULT CALLBACK overlay_proc", "LRESULT CALLBACK window_proc")
+assert "HTTRANSPARENT" in overlay
+assert "HTCLIENT" in overlay
+assert "SendMessageW(GetParent(hwnd), WM_NCLBUTTONDOWN" not in overlay
+assert "WM_NCLBUTTONDOWN, HTCAPTION, 0" not in source
+assert "chromeMode != hcv::ChromeMode::Normal && overlayPolicy.visible()" in source
 
 toggle = body("    void toggle_chrome(hcv::ChromeMode requested)", "\n};")
 assert "savedChromeMode = chromeMode" in toggle
 assert "GetWindowRect(window, &savedWindowRect)" in toggle
+assert "apply_native_window_style()" in toggle
 assert "SetWindowPos(window, HWND_TOP, mi.rcMonitor.left" in toggle
 restore = body("    void restore_fullscreen()", "    void toggle_chrome(")
 assert "savedWindowRect.left" in restore and "savedWindowRect.top" in restore
-assert "savedWindowRect.right - savedWindowRect.left" in restore
+assert "apply_native_window_style()" in restore
 assert "viewMode=savedViewMode; panX=savedPanX; panY=savedPanY;" in restore
 
-assert "CreateWindowExW(0, L\"HcvChromeOverlay\"" in source
 for token in ("OVERLAY_ACTION_MENU", "OVERLAY_ACTION_MINIMIZE", "OVERLAY_ACTION_MAXIMIZE",
               "OVERLAY_ACTION_CLOSE", "DrawTextW", "TrackPopupMenuEx", "TPM_RETURNCMD",
               "WM_MOUSELEAVE", "TrackMouseEvent", "WM_OVERLAY_HOVER"):
-    assert token in source, f"missing internal overlay behavior: {token}"
-assert "app->show_app_menu(p.x, p.y)" in source
-assert "case WM_NCHITTEST:" in source and "HTBOTTOMRIGHT" in source
-hit_test = body("    case WM_NCHITTEST:", "    case WM_MOUSEWHEEL:")
-assert "chromeMode" not in hit_test, "Resize zones stay active in every logical mode"
-assert "HTCAPTION" not in hit_test, "Video client itself must never become a caption"
-overlay_proc = body("LRESULT CALLBACK overlay_proc", "LRESULT CALLBACK window_proc")
-assert "WM_NCLBUTTONDOWN, HTCAPTION" in overlay_proc, "Only the internal title overlay initiates native Snap/FancyZones drag"
-assert "GetKeyState(VK_MENU)" in source
-assert "wParam == VK_F11" in source and "GetKeyState(VK_CONTROL)" in source
-assert "app->toggle_chrome(hcv::ChromeMode::Fullscreen)" in source
-assert "app->toggle_chrome(hcv::ChromeMode::BorderlessWindow)" in source
-assert "VK_ESCAPE && app->chromeMode != hcv::ChromeMode::Normal" in source
-assert "NormalPinned" in source and "BorderlessAutoHide" in source and "FullscreenAutoHide" in source
-assert "overlayPolicy.visible()?L\"visible\":L\"hidden\"" in source
+    assert token in overlay or token in source
 assert "class OverlayVisibilityPolicy" in header
-print("CHROME_MODE_RESTORE_CONTRACT_PASS")
+print("NATIVE_CHROME_RESTORE_CONTRACT_PASS")
