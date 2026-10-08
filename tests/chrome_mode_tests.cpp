@@ -5,11 +5,12 @@
 int main() {
     using hcv::ChromeMode;
     using hcv::ChromeState;
-    hcv::OverlayVisibilityPolicy overlay;
+    using hcv::WorkRect;
 
     assert(hcv::reveal_strip_px(96) == 4);
     assert(hcv::reveal_strip_px(120) == 5);
     assert(hcv::reveal_strip_px(144) == 6);
+    assert(hcv::reveal_strip_px(192) == 8);
     assert(hcv::cursor_in_reveal_strip(500, 0, 0, 0, 1920, 1080, 4));
     assert(hcv::cursor_in_reveal_strip(500, 4, 0, 0, 1920, 1080, 4));
     assert(!hcv::cursor_in_reveal_strip(500, 5, 0, 0, 1920, 1080, 4));
@@ -20,32 +21,32 @@ int main() {
     assert(hcv::chrome_state(ChromeMode::BorderlessWindow) == ChromeState::BorderlessAutoHide);
     assert(hcv::chrome_state(ChromeMode::Fullscreen) == ChromeState::FullscreenAutoHide);
 
-    overlay.set_mode(ChromeMode::Normal, 0);
-    overlay.timer(10000);
-    assert(overlay.visible()); // Normal chrome stays pinned.
+    constexpr WorkRect work{0, 0, 3840, 2080};
+    // Left/right halves, all four quarters, including invisible 8px edges.
+    assert(hcv::snap_like_placement({-8, -8, 1920, 2088}, work, 24));
+    assert(hcv::snap_like_placement({1920, -8, 3848, 2088}, work, 24));
+    assert(hcv::snap_like_placement({-8, -8, 1920, 1040}, work, 24));
+    assert(hcv::snap_like_placement({1920, -8, 3848, 1040}, work, 24));
+    assert(hcv::snap_like_placement({-8, 1040, 1920, 2088}, work, 24));
+    assert(hcv::snap_like_placement({1920, 1040, 3848, 2088}, work, 24));
+    // A free-floating or full-screen window must not be snap-locked.
+    assert(!hcv::snap_like_placement({200, 120, 1800, 1200}, work, 24));
+    assert(!hcv::snap_like_placement({0, 0, 3840, 2080}, work, 24));
+    assert(!hcv::snap_like_placement({0, 0, 100, 100}, work, -1));
+    assert(!hcv::snap_like_placement({0, 0, 0, 100}, work, 24));
+    // Multi-monitor negative work coordinates.
+    constexpr WorkRect leftMonitor{-1920, 0, 0, 1040};
+    assert(hcv::snap_like_placement({-1928, -8, -960, 1048}, leftMonitor, 24));
+    assert(!hcv::snap_like_placement({-1800, 100, -700, 800}, leftMonitor, 24));
+    // Conservative false positive: a floating window manually aligned to
+    // work-area corner also keeps its caption. No claim of OS Snap certainty.
+    assert(hcv::snap_like_placement({0, 0, 1000, 800}, work, 24));
 
-    overlay.set_mode(ChromeMode::BorderlessWindow, 10000);
-    assert(!overlay.visible() && overlay.auto_hide());
-    overlay.reveal(10100); // Parent top reveal zone.
-    overlay.timer(11299);
-    assert(overlay.visible());
-    overlay.timer(11300);
-    assert(!overlay.visible());
+    assert(hcv::keep_revealed_caption(true, true, false, false));
+    assert(hcv::keep_revealed_caption(true, false, true, false));
+    assert(hcv::keep_revealed_caption(true, false, false, true));
+    assert(!hcv::keep_revealed_caption(true, false, false, false));
+    assert(!hcv::keep_revealed_caption(false, true, true, true));
 
-    overlay.reveal(12000);
-    overlay.pointer_over_overlay(true, 12050);
-    overlay.timer(20000);
-    assert(overlay.visible()); // Hovering the child keeps chrome visible.
-    overlay.pointer_over_overlay(false, 20000);
-    overlay.timer(21199);
-    assert(overlay.visible());
-    overlay.timer(21200);
-    assert(!overlay.visible());
-
-    overlay.set_mode(ChromeMode::Fullscreen, 22000);
-    assert(!overlay.visible() && overlay.auto_hide());
-    overlay.reveal(22001);
-    overlay.timer(23201);
-    assert(!overlay.visible());
-    std::cout << "CHROME_MODE_TESTS_PASS\n";
+    std::cout << "NATIVE_CAPTION_SNAP_GUARD_TESTS_PASS\n";
 }

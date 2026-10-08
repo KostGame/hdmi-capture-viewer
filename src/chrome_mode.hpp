@@ -30,44 +30,42 @@ inline ChromeState chrome_state(ChromeMode mode) noexcept {
     return ChromeState::NormalPinned;
 }
 
-// Clock-driven policy keeps reveal and hide behavior testable without Win32.
-class OverlayVisibilityPolicy {
-public:
-    static constexpr std::uint64_t HideDelayMs = 1200;
+// Conservative placement guard, NOT an official Windows Snap-state query.
+// GetWindowRect may include invisible resize borders. A freely placed window
+// close to two work-area edges may be treated as pinned; keeping its caption
+// is safer than changing geometry unexpectedly.
+struct WorkRect { int left, top, right, bottom; };
 
-    void set_mode(ChromeMode mode, std::uint64_t nowMs) noexcept {
-        mode_ = mode;
-        visible_ = mode == ChromeMode::Normal;
-        lastActivityMs_ = nowMs;
-        if (mode == ChromeMode::Normal) pointerOverOverlay_ = false;
-    }
+inline bool close_edge(int a, int b, int tolerance) noexcept {
+    const auto distance = static_cast<std::int64_t>(a) - b;
+    return distance >= -static_cast<std::int64_t>(tolerance) &&
+        distance <= static_cast<std::int64_t>(tolerance);
+}
 
-    void reveal(std::uint64_t nowMs) noexcept {
-        visible_ = true;
-        lastActivityMs_ = nowMs;
-    }
+inline bool snap_like_placement(
+    WorkRect window, WorkRect work, int tolerance) noexcept {
+    if (tolerance < 0) return false;
+    const auto width = static_cast<std::int64_t>(window.right) - window.left;
+    const auto height = static_cast<std::int64_t>(window.bottom) - window.top;
+    const auto workWidth = static_cast<std::int64_t>(work.right) - work.left;
+    const auto workHeight = static_cast<std::int64_t>(work.bottom) - work.top;
+    if (width <= 0 || height <= 0 || workWidth <= 0 || workHeight <= 0)
+        return false;
+    // Maximize is guarded separately with IsZoomed.
+    if (width + 2LL*tolerance >= workWidth &&
+        height + 2LL*tolerance >= workHeight) return false;
+    const bool alignedX = close_edge(window.left, work.left, tolerance) ||
+        close_edge(window.right, work.right, tolerance);
+    const bool alignedY = close_edge(window.top, work.top, tolerance) ||
+        close_edge(window.bottom, work.bottom, tolerance);
+    return alignedX && alignedY;
+}
 
-    void pointer_over_overlay(bool over, std::uint64_t nowMs) noexcept {
-        pointerOverOverlay_ = over;
-        if (over) reveal(nowMs);
-        else lastActivityMs_ = nowMs;
-    }
-
-    void timer(std::uint64_t nowMs) noexcept {
-        if (mode_ != ChromeMode::Normal && visible_ && !pointerOverOverlay_ &&
-            nowMs >= lastActivityMs_ && nowMs - lastActivityMs_ >= HideDelayMs) {
-            visible_ = false;
-        }
-    }
-
-    bool visible() const noexcept { return visible_; }
-    bool auto_hide() const noexcept { return mode_ != ChromeMode::Normal; }
-
-private:
-    ChromeMode mode_{ChromeMode::Normal};
-    bool visible_{true};
-    bool pointerOverOverlay_{};
-    std::uint64_t lastActivityMs_{};
-};
+inline bool keep_revealed_caption(
+    bool alreadyRevealed, bool snappedOrMaximized,
+    bool movingOrResizing, bool systemMenuActive) noexcept {
+    return alreadyRevealed &&
+        (snappedOrMaximized || movingOrResizing || systemMenuActive);
+}
 
 } // namespace hcv

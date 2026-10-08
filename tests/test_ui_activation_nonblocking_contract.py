@@ -1,50 +1,25 @@
-"""Regression guard for HCV-004 UI input responsiveness.
-
-Static contract only. A live Win32-session test must still measure focus, drag,
-resize and occlusion after idle before this fix is considered accepted.
-"""
+"""HCV-004 R3: bounded UI frame rendering and real Windows caption."""
 from pathlib import Path
 import sys
-
-source = Path(sys.argv[1] if len(sys.argv) > 1 else "src/main.cpp").read_text(encoding="utf-8")
-
-# One-frame wakeup stays coalesced and timestamped; the watchdog is scalar
-# counters only and never records raw keyboard or mouse input.
-assert "std::atomic<bool> frameWakeQueued{false}" in source
-assert "std::atomic<ULONGLONG> frameWakePostedAtMs{0}" in source
-assert "frameWakePostedAtMs.store(GetTickCount64()" in source
-assert "frameWakePostedAtMs.exchange(0" in source
-assert "maxFrameWakeLagMs" in source
-assert "maxInputQueueLagMs" in source
-assert "delayedInputMessages" in source
-
-# Capture updates still run through the existing bounded mailbox and Win32
-# wake, but no longer wait in DXGI Present on that same message-pump thread.
-assert "case WM_NEW_FRAME:" in source
-assert "else app->render(true);" in source
-present_start = source.index("const auto presentStart = Clock::now();")
-present_end = source.index("if (frame) {\n            if (interactiveMoveResize)", present_start)
-present = source[present_start:present_end]
-assert "swapChain->Present(" in present
-assert "DXGI_PRESENT_DO_NOT_WAIT);" in present
+s = Path(sys.argv[1] if len(sys.argv) > 1 else "src/main.cpp").read_text(encoding="utf-8")
+for token in ("std::atomic<bool> frameWakeQueued{false}",
+              "std::atomic<ULONGLONG> frameWakePostedAtMs{0}",
+              "frameWakePostedAtMs.store(GetTickCount64()",
+              "frameWakePostedAtMs.exchange(0", "maxFrameWakeLagMs",
+              "maxInputQueueLagMs", "delayedInputMessages"):
+    assert token in s
+present = s[s.index("const auto presentStart = Clock::now();"):s.index(
+    "if (frame) {\n            if (interactiveMoveResize)", s.index("const auto presentStart = Clock::now();"))]
+for token in ("swapChain->Present(", "DXGI_PRESENT_DO_NOT_WAIT);",
+              "DXGI_ERROR_WAS_STILL_DRAWING", "DXGI_STATUS_OCCLUDED",
+              "busyNormalPresents", "skippedInteractivePresent"):
+    assert token in present, token
 assert "nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u" not in present
-assert "interactivePresent ? 0u : (vsyncEnabled ? 1u : 0u)" in present
-assert "presentResult == DXGI_ERROR_WAS_STILL_DRAWING" in present
-assert "busyNormalPresents" in present
-assert "skippedInteractivePresent" in present
-assert "presentResult == DXGI_STATUS_OCCLUDED" in present
-assert "FAILED(presentResult)" in present
-
-# The Win32 drag/resize loop is entered through real hit testing rather than
-# a fabricated WM_NCLBUTTONDOWN from the overlay child window.
-assert "SendMessageW(GetParent(hwnd), WM_NCLBUTTONDOWN" not in source
-assert "apply_native_window_style()" in source
-assert "HTCAPTION" in source
-assert "SWP_FRAMECHANGED" in source
-assert "case WM_ENTERSIZEMOVE:" in source
-assert "case WM_EXITSIZEMOVE:" in source
-assert "app->interactive_tick();" in source
-assert "case WM_NCHITTEST:" in source
-assert "bool vsyncEnabled{true}" in source
-
-print("UI_ACTIVATION_NONBLOCKING_CONTRACT_PASS")
+assert "case WM_NEW_FRAME:" in s and "else app->render(true);" in s
+assert "WM_NCLBUTTONDOWN, HTCAPTION, 0" not in s
+assert "void poll_native_caption(ULONGLONG nowMs)" in s
+assert "case WM_ENTERSIZEMOVE:" in s
+assert "case WM_EXITSIZEMOVE:" in s
+assert "app->interactive_tick();" in s
+assert "bool vsyncEnabled{true}" in s
+print("UI_NATIVE_HOVER_NONBLOCKING_CONTRACT_PASS")

@@ -55,16 +55,9 @@ constexpr UINT LIVE_MOVE_TIMER_PERIOD_MS = 16;
 constexpr UINT DEVICE_COMMAND_BASE = 1000;
 constexpr UINT MODE_COMMAND_BASE = 2000;
 constexpr UINT MAX_MENU_ITEMS = 500;
-constexpr UINT WM_OVERLAY_ACTION = WM_APP + 4;
-constexpr UINT WM_OVERLAY_HOVER = WM_APP + 5;
-constexpr UINT WM_OVERLAY_MENU = WM_APP + 6;
-constexpr int OVERLAY_ACTION_MENU = 1;
-constexpr int OVERLAY_ACTION_MINIMIZE = 2;
-constexpr int OVERLAY_ACTION_MAXIMIZE = 3;
-constexpr int OVERLAY_ACTION_CLOSE = 4;
-constexpr int OVERLAY_HEIGHT_96 = 40;
 constexpr int RESIZE_EDGE_96 = 8;
-constexpr UINT OVERLAY_HIDE_PERIOD_MS = 200;
+constexpr UINT NATIVE_CAPTION_POLL_MS = 200;
+constexpr ULONGLONG NATIVE_CAPTION_HIDE_DELAY_MS = 1200;
 
 struct Mode {
     GUID subtype{};
@@ -291,9 +284,9 @@ std::wstring hresult_text(HRESULT hr) {
 
 struct App {
     HWND window{};
-    HWND chromeOverlay{};
     HMENU appMenu{};
     bool menuActive{};
+    bool systemMenuActive{};
     std::vector<Device> devices;
     std::size_t selectedDevice{};
     std::size_t selectedMode{};
@@ -331,7 +324,8 @@ struct App {
     std::mutex captureMetricsMutex;
     Clock::time_point lastTitleUpdate{};
     hcv::ChromeMode chromeMode{hcv::ChromeMode::Normal};
-    hcv::OverlayVisibilityPolicy overlayPolicy;
+    bool nativeCaptionRevealed{};
+    ULONGLONG nativeCaptionLastHoverMs{};
     hcv::ViewMode viewMode{hcv::ViewMode::Auto};
     float panX{}, panY{};
     bool spacePanning{}, draggingPan{}, draggingMove{};
@@ -839,7 +833,7 @@ struct App {
                 ID3D11ShaderResourceView* view = presentationView; ID3D11SamplerState* smp = sampler.Get();
                 context->PSSetShaderResources(0, 1, &view); context->PSSetSamplers(0, 1, &smp); context->Draw(4, 0);
                 ID3D11ShaderResourceView* none = nullptr; context->PSSetShaderResources(0, 1, &none);
-                if(viewMode==hcv::ViewMode::Pixel100 || (chromeMode!=hcv::ChromeMode::Normal && overlayPolicy.visible())){
+                if(viewMode==hcv::ViewMode::Pixel100){
                     const float blendFactor[4]{};
                     context->OMSetBlendState(overlayBlend.Get(), blendFactor, 0xffffffffu);
                     context->PSSetShader(overlayShader.Get(),nullptr,0);
@@ -854,13 +848,6 @@ struct App {
                         const auto sy=hcv::scrollbar_thumb(static_cast<int>(height),static_cast<int>(textureHeight),panY,static_cast<int>(height)-8);
                         if(sx.needed)overlay_quad(4.0f+static_cast<float>(sx.start),height-thickness-2,static_cast<float>(sx.length),thickness);
                         if(sy.needed)overlay_quad(width-thickness-2,4.0f+static_cast<float>(sy.start),thickness,static_cast<float>(sy.length));
-                    }
-                    if(chromeMode!=hcv::ChromeMode::Normal && overlayPolicy.visible()){
-                        const float border=std::max(1.0f, static_cast<float>(GetDpiForWindow(window))/96.0f);
-                        overlay_quad(0,0,width,border);
-                        overlay_quad(0,height-border,width,border);
-                        overlay_quad(0,0,border,height);
-                        overlay_quad(width-border,0,border,height);
                     }
                     context->OMSetBlendState(nullptr, blendFactor, 0xffffffffu);
                 }
@@ -918,7 +905,7 @@ struct App {
                 L"/slow input " + std::to_wstring(delayedInputMessages) +
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
                 L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
-                L" overlay " + (overlayPolicy.visible()?L"visible":L"hidden") +
+                L" native caption " + (native_caption_active()?L"visible":L"hidden") +
                 L"; view " + (viewMode==hcv::ViewMode::Auto?L"Auto":viewMode==hcv::ViewMode::Pixel100?L"Pixel100":viewMode==hcv::ViewMode::Fit?L"Fit":L"Fill") + L" pan " + std::to_wstring(static_cast<int>(panX)) + L"," + std::to_wstring(static_cast<int>(panY)) + L"; merged view renders " + std::to_wstring(coalescedViewRenderRequests) + L"; live frames " + std::to_wstring(liveMoveFrames) +
                 L" (app metrics; NOT input-to-photon)";
             update_title();
@@ -1067,37 +1054,81 @@ struct App {
             {mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom});
     }
 
-    void reveal_chrome_from_cursor(std::uint64_t nowMs) {
-        if (!window || !overlayPolicy.auto_hide() || menuActive || IsIconic(window)) return;
+    bool native_caption_active() const {
+        return chromeMode == hcv::ChromeMode::Normal ||
+            (chromeMode == hcv::ChromeMode::BorderlessWindow && nativeCaptionRevealed);
+    }
+
+    bool snap_like_window() const {
+        if (!window || chromeMode == hcv::ChromeMode::Fullscreen) return false;
+        if (IsZoomed(window)) return true;
+        RECT outer{};
+        MONITORINFO monitor{sizeof(monitor)};
+        if (!GetWindowRect(window, &outer) ||
+            !GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor))
+            return false;
+        // GetWindowRect can include invisible resize borders (Windows 11).
+        const int dpi = static_cast<int>(GetDpiForWindow(window));
+        const int tolerance = std::max(12, MulDiv(24, dpi, 96));
+        return hcv::snap_like_placement(
+            {outer.left, outer.top, outer.right, outer.bottom},
+            {monitor.rcWork.left, monitor.rcWork.top,
+             monitor.rcWork.right, monitor.rcWork.bottom}, tolerance);
+    }
+
+    void poll_native_caption(ULONGLONG nowMs) {
+        if (!window || chromeMode != hcv::ChromeMode::BorderlessWindow ||
+            IsIconic(window)) return;
+        // Never remove a revealed native caption from a snapped/maximized
+        // window, or while Windows owns the move/size loop or system menu.
+        // Snap detection here is deliberately a conservative placement heuristic,
+        // not a claim that Win32 provides a public Snap-state API.
+        if (hcv::keep_revealed_caption(nativeCaptionRevealed,
+                snap_like_window(), interactiveMoveResize || draggingMove ||
+                GetCapture() == window, systemMenuActive || menuActive)) {
+            nativeCaptionLastHoverMs = nowMs;
+            return;
+        }
+        if (interactiveMoveResize || draggingMove || systemMenuActive ||
+            menuActive || GetCapture() == window) return;
+
         POINT cursor{};
         RECT outer{};
         if (!GetCursorPos(&cursor) || !GetWindowRect(window, &outer)) return;
-        const auto in = visible_insets();
-        const int left = outer.left + in.left;
-        const int top = outer.top + in.top;
-        const int right = outer.right - in.right;
-        const int bottom = outer.bottom - in.bottom;
-        if (hcv::cursor_in_reveal_strip(
-                cursor.x, cursor.y, left, top, right, bottom,
-                hcv::reveal_strip_px(static_cast<int>(GetDpiForWindow(window))))) {
-            overlayPolicy.reveal(nowMs);
-            update_overlay_visibility();
-        }
-    }
 
-    void layout_overlay() {
-        if (!window || !chromeOverlay) return;
-        RECT client{};
-        if (!GetClientRect(window, &client)) return;
-        const auto in = visible_insets();
-        const int edge = resize_edge();
-        const int x = std::max(edge, in.left + edge);
-        const int y = std::max(edge, in.top + edge);
-        const int clientRight = static_cast<int>(client.right);
-        const int width = std::max(1, clientRight - x - std::max(edge, in.right + edge));
-        SetWindowPos(chromeOverlay, HWND_TOP, x, y, width, overlay_height(),
-            SWP_NOACTIVATE);
-        update_overlay_visibility();
+        // Do not react while another app covers the narrow top-edge hotspot.
+        const HWND hovered = WindowFromPoint(cursor);
+        const bool ownWindow = hovered &&
+            GetAncestor(hovered, GA_ROOT) == window;
+        const auto insets = visible_insets();
+        const int left = outer.left + insets.left;
+        const int right = outer.right - insets.right;
+        const int top = outer.top + insets.top;
+        const int revealPx = hcv::reveal_strip_px(
+            static_cast<int>(GetDpiForWindow(window)));
+        POINT clientOrigin{0, 0};
+        ClientToScreen(window, &clientOrigin);
+        const int hoverBottom = nativeCaptionRevealed
+            ? clientOrigin.y + revealPx
+            : top + revealPx;
+
+        const bool hoveredCaption = ownWindow &&
+            cursor.x >= left && cursor.x < right &&
+            cursor.y >= top && cursor.y <= hoverBottom;
+        if (hoveredCaption) {
+            nativeCaptionLastHoverMs = nowMs;
+            if (!nativeCaptionRevealed) {
+                nativeCaptionRevealed = true;
+                apply_native_window_style();
+                request_view_render();
+            }
+        } else if (nativeCaptionRevealed &&
+                   nowMs >= nativeCaptionLastHoverMs &&
+                   nowMs - nativeCaptionLastHoverMs >= NATIVE_CAPTION_HIDE_DELAY_MS) {
+            nativeCaptionRevealed = false;
+            apply_native_window_style();
+            request_view_render();
+        }
     }
 
     void show_shortcuts() const {
@@ -1118,31 +1149,14 @@ struct App {
             L"HDMI Capture Viewer — клавиши", MB_OK | MB_ICONINFORMATION);
     }
 
-    void update_overlay_visibility() {
-        if (!chromeOverlay) return;
-        // Native Windows owns the titlebar in Normal mode. The child chrome
-        // exists only in frameless/fullscreen presentation modes.
-        const bool visible = chromeMode != hcv::ChromeMode::Normal && overlayPolicy.visible();
-        const bool currentlyVisible = IsWindowVisible(chromeOverlay) != FALSE;
-        if (currentlyVisible != visible) {
-            ShowWindow(chromeOverlay, visible ? SW_SHOWNA : SW_HIDE);
-            if (visible) InvalidateRect(chromeOverlay, nullptr, FALSE);
-            request_view_render(); // redraw the matching internal border without changing parent geometry.
-        }
-    }
-
     void show_app_menu(int x, int y) {
         rebuild_menus();
         if (!appMenu) return;
         menuActive = true;
-        overlayPolicy.reveal(GetTickCount64());
-        update_overlay_visibility();
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenuEx(appMenu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
             x, y, window, nullptr);
         menuActive = false;
-        overlayPolicy.reveal(GetTickCount64());
-        update_overlay_visibility();
         if (command) SendMessageW(window, WM_COMMAND, MAKEWPARAM(command, 0), 0);
         PostMessageW(window, WM_NULL, 0, 0);
     }
@@ -1152,34 +1166,32 @@ struct App {
         const LONG_PTR current = GetWindowLongPtrW(window, GWL_STYLE);
         // Keep WS_THICKFRAME, WS_SYSMENU and min/max flags: Windows owns
         // resizing, foreground activation, Snap and system commands.
-        const LONG_PTR desired = chromeMode == hcv::ChromeMode::Normal
+        const LONG_PTR desired = native_caption_active()
             ? (current | WS_CAPTION)
             : (current & ~static_cast<LONG_PTR>(WS_CAPTION));
-        if (desired != current) {
-            SetLastError(ERROR_SUCCESS);
-            const LONG_PTR old = SetWindowLongPtrW(window, GWL_STYLE, desired);
-            if (old == 0 && GetLastError() != ERROR_SUCCESS) {
-                SetWindowLongPtrW(window, GWL_STYLE, current);
-                return;
-            }
-        }
+        if (desired == current) return;
+        SetLastError(ERROR_SUCCESS);
+        const LONG_PTR old = SetWindowLongPtrW(window, GWL_STYLE, desired);
+        if (old == 0 && GetLastError() != ERROR_SUCCESS) return;
+        // Native caption is never drawn by the viewer; let Windows recalculate
+        // the non-client area. Outer bounds remain fixed, client size can shift.
         SetWindowPos(window, nullptr, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
             SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        layout_overlay();
     }
 
     void set_chrome_mode(hcv::ChromeMode mode) {
         chromeMode = mode;
-        overlayPolicy.set_mode(mode, GetTickCount64());
+        nativeCaptionRevealed = false;
+        nativeCaptionLastHoverMs = GetTickCount64();
         apply_native_window_style();
-        update_overlay_visibility();
         request_view_render();
     }
 
     void restore_fullscreen() {
         chromeMode = savedChromeMode;
-        overlayPolicy.set_mode(chromeMode, GetTickCount64());
+        nativeCaptionRevealed = false;
+        nativeCaptionLastHoverMs = GetTickCount64();
         apply_native_window_style();
         const int width = savedWindowRect.right - savedWindowRect.left;
         const int height = savedWindowRect.bottom - savedWindowRect.top;
@@ -1188,7 +1200,6 @@ struct App {
         if (savedShowCmd == SW_SHOWMAXIMIZED || savedShowCmd == SW_MAXIMIZE) ShowWindow(window, SW_MAXIMIZE);
         else if (savedShowCmd == SW_SHOWMINIMIZED || savedShowCmd == SW_MINIMIZE || savedShowCmd == SW_SHOWMINNOACTIVE) ShowWindow(window, SW_MINIMIZE);
         viewMode=savedViewMode; panX=savedPanX; panY=savedPanY;
-        update_overlay_visibility();
         rebuild_menus();
         request_view_render();
     }
@@ -1209,7 +1220,7 @@ struct App {
         savedShowCmd = savedPlacement.showCmd;
         savedViewMode=viewMode; savedPanX=panX; savedPanY=panY;
         chromeMode = hcv::ChromeMode::Fullscreen;
-        overlayPolicy.set_mode(chromeMode, GetTickCount64());
+        nativeCaptionRevealed = false;
         apply_native_window_style();
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mi);
@@ -1218,7 +1229,6 @@ struct App {
             SWP_NOACTIVATE);
         viewMode=hcv::ViewMode::Fill;
         panX=panY=0;
-        update_overlay_visibility();
         rebuild_menus();
         request_view_render();
     }
@@ -1226,117 +1236,30 @@ struct App {
 
 App* app = nullptr;
 
-int overlay_button_at(HWND hwnd, int x) {
-    RECT client{}; GetClientRect(hwnd, &client);
-    const UINT dpi = GetDpiForWindow(GetParent(hwnd));
-    const int button = std::max(1, MulDiv(44, static_cast<int>(dpi), 96));
-    const int menuWidth = std::max(1, MulDiv(42, static_cast<int>(dpi), 96));
-    if (x >= client.right - button) return OVERLAY_ACTION_CLOSE;
-    if (x >= client.right - 2 * button) return OVERLAY_ACTION_MAXIMIZE;
-    if (x >= client.right - 3 * button) return OVERLAY_ACTION_MINIMIZE;
-    if (x < menuWidth) return OVERLAY_ACTION_MENU;
-    return 0;
-}
-
-LRESULT CALLBACK overlay_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
-    switch (message) {
-    case WM_NCHITTEST: {
-        // The visual title is a child HWND, but its empty drag area must
-        // hit-test as native caption on the parent HWND. Keep the menu and
-        // caption buttons interactive inside this child.
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        ScreenToClient(hwnd, &point);
-        return overlay_button_at(hwnd, point.x) ? HTCLIENT : HTTRANSPARENT;
-    }
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps);
-        RECT r{}; GetClientRect(hwnd, &r);
-        HBRUSH bg = CreateSolidBrush(RGB(28, 30, 34)); FillRect(dc, &r, bg); DeleteObject(bg);
-        const UINT dpi = GetDpiForWindow(GetParent(hwnd));
-        auto px = [&](int value96) { return std::max(1, MulDiv(value96, static_cast<int>(dpi), 96)); };
-        const int button = px(44);
-        HPEN border = CreatePen(PS_SOLID, px(1), RGB(92, 96, 104));
-        HGDIOBJ oldPen = SelectObject(dc, border); HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-        Rectangle(dc, 0, 0, r.right, r.bottom); SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(border);
-        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(238, 240, 244));
-        HFONT font = CreateFontW(-px(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        HGDIOBJ oldFont = SelectObject(dc, font);
-        RECT menuText{px(8), 0, px(38), r.bottom}; DrawTextW(dc, L"\u2630", -1, &menuText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        RECT title{px(48), 0, r.right - 3 * button, r.bottom};
-        DrawTextW(dc, L"HDMI Capture Viewer", -1, &title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        RECT b{r.right - 3 * button, 0, r.right - 2 * button, r.bottom};
-        DrawTextW(dc, L"_", -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        b.left += button; b.right += button;
-        DrawTextW(dc, IsZoomed(GetParent(hwnd)) ? L"\u2750" : L"\u25A1", -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        b.left += button; b.right += button;
-        DrawTextW(dc, L"\u00D7", -1, &b, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(dc, oldFont); DeleteObject(font); EndPaint(hwnd, &ps); return 0;
-    }
-    case WM_MOUSEMOVE: {
-        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
-        SendMessageW(GetParent(hwnd), WM_OVERLAY_HOVER, TRUE, 0);
-        return 0;
-    }
-    case WM_MOUSELEAVE:
-        SendMessageW(GetParent(hwnd), WM_OVERLAY_HOVER, FALSE, 0); return 0;
-    case WM_LBUTTONDOWN: {
-        const int x = GET_X_LPARAM(lParam);
-        const int action = overlay_button_at(hwnd, x);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, action);
-        if (action) SetCapture(hwnd);
-        // Non-button title clicks are handled by the parent HTCAPTION.
-        // No synthetic WM_NCLBUTTONDOWN or zero screen coordinates.
-        return 0;
-    }
-    case WM_LBUTTONUP: {
-        const int action = static_cast<int>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        const int releasedAction = overlay_button_at(hwnd, GET_X_LPARAM(lParam));
-        if (GetCapture() == hwnd) ReleaseCapture();
-        if (action && action == releasedAction) SendMessageW(GetParent(hwnd), WM_OVERLAY_ACTION, action, 0);
-        return 0;
-    }
-    case WM_CANCELMODE:
-    case WM_CAPTURECHANGED:
-        if (GetCapture() == hwnd) ReleaseCapture();
-        return 0;
-    case WM_RBUTTONUP: {
-        POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
-        SendMessageW(GetParent(hwnd), WM_OVERLAY_MENU, 0, MAKELPARAM(p.x, p.y)); return 0;
-    }
-    }
-    return DefWindowProcW(hwnd, message, wParam, lParam);
-}
-
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (!app) return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
     case WM_NCCALCSIZE:
-        // Normal mode must retain the true Windows caption and frame.
-        // Frameless and fullscreen modes own the full client rectangle.
-        if (app->chromeMode != hcv::ChromeMode::Normal && wParam) return 0;
+        // DefWindowProc creates the actual native titlebar when requested.
+        if (!app->native_caption_active() && wParam) return 0;
         return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_CREATE: {
         app->window = hwnd;
-        app->chromeOverlay = CreateWindowExW(0, L"HcvChromeOverlay", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-            0, app->resize_edge(), 1, app->overlay_height(), hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-        app->overlayPolicy.set_mode(app->chromeMode, GetTickCount64());
-        if (app->chromeOverlay) app->layout_overlay();
-        SetTimer(hwnd, CHROME_HIDE_TIMER, OVERLAY_HIDE_PERIOD_MS, nullptr);
-        return app->chromeOverlay ? 0 : -1;
+        app->nativeCaptionLastHoverMs = GetTickCount64();
+        SetTimer(hwnd, CHROME_HIDE_TIMER, NATIVE_CAPTION_POLL_MS, nullptr);
+        return 0;
     }
     case WM_ERASEBKGND: return 1; // D3D paints the whole client: prevent white/gray flashes.
     case WM_ENTERSIZEMOVE:
         app->interactiveMoveResize = true;
+        app->nativeCaptionLastHoverMs = GetTickCount64();
         app->lastInteractivePaint = {};
         SetTimer(hwnd, LIVE_MOVE_TIMER, LIVE_MOVE_TIMER_PERIOD_MS, nullptr);
         return 0;
     case WM_EXITSIZEMOVE:
         KillTimer(hwnd, LIVE_MOVE_TIMER);
         app->interactiveMoveResize = false;
+        app->nativeCaptionLastHoverMs = GetTickCount64();
         app->render(true, true, true); // Apply at most the newest pending size once, then render it.
         app->update_title(true);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -1345,20 +1268,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_SIZING:
         app->interactive_tick(); // Synchronous progress even if posted frame messages stall.
         return DefWindowProcW(hwnd, message, wParam, lParam);
+    case WM_ENTERMENULOOP:
+        app->systemMenuActive = true;
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    case WM_EXITMENULOOP:
+        app->systemMenuActive = false;
+        app->nativeCaptionLastHoverMs = GetTickCount64();
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_TIMER:
         if (wParam == LIVE_MOVE_TIMER) {
             app->interactive_tick();
             return 0;
         }
         if (wParam == CHROME_HIDE_TIMER) {
-            const auto now = GetTickCount64();
-            if (app->menuActive) {
-                app->overlayPolicy.reveal(now);
-            } else {
-                app->reveal_chrome_from_cursor(now);
-                app->overlayPolicy.timer(now);
-            }
-            app->update_overlay_visibility();
+            app->poll_native_caption(GetTickCount64());
             return 0;
         }
         break;
@@ -1371,14 +1294,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     }
     case WM_SIZE:
-        if (app->chromeOverlay) app->layout_overlay();
         if (wParam != SIZE_MINIMIZED && LOWORD(lParam) && HIWORD(lParam)) {
             app->resizeGate.request(LOWORD(lParam), HIWORD(lParam));
             if (!app->interactiveMoveResize) app->request_view_render();
         }
         return 0;
     case WM_NCHITTEST: {
-        if (app->chromeMode == hcv::ChromeMode::Normal)
+        if (app->native_caption_active())
             return DefWindowProcW(hwnd, message, wParam, lParam);
 
         // Window-owned non-client hit test. Windows (not a child control)
@@ -1402,17 +1324,6 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             default: break;
             }
         }
-        if (app->chromeMode == hcv::ChromeMode::BorderlessWindow &&
-            app->chromeOverlay && IsWindowVisible(app->chromeOverlay)) {
-            RECT titleRect{};
-            if (GetWindowRect(app->chromeOverlay, &titleRect) &&
-                PtInRect(&titleRect, screen)) {
-                POINT titlePoint = screen;
-                ScreenToClient(app->chromeOverlay, &titlePoint);
-                if (!overlay_button_at(app->chromeOverlay, titlePoint.x))
-                    return HTCAPTION;
-            }
-        }
         return HTCLIENT;
     }
     case WM_MOUSELEAVE:
@@ -1421,27 +1332,6 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; ClientToScreen(hwnd, &p);
         app->show_app_menu(p.x, p.y); return 0;
     }
-    case WM_NCRBUTTONUP:
-        if (wParam == HTCAPTION && app->chromeMode == hcv::ChromeMode::BorderlessWindow) {
-            app->show_app_menu(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-            return 0;
-        }
-        break;
-    case WM_OVERLAY_HOVER:
-        app->overlayPolicy.pointer_over_overlay(wParam != 0, GetTickCount64());
-        app->update_overlay_visibility(); return 0;
-    case WM_OVERLAY_MENU: {
-        POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
-        app->show_app_menu(p.x, p.y); return 0;
-    }
-    case WM_OVERLAY_ACTION:
-        if (wParam == OVERLAY_ACTION_MENU) {
-            RECT r{}; GetWindowRect(app->chromeOverlay, &r); app->show_app_menu(r.left, r.bottom); return 0;
-        }
-        if (wParam == OVERLAY_ACTION_MINIMIZE) { ShowWindow(hwnd, SW_MINIMIZE); return 0; }
-        if (wParam == OVERLAY_ACTION_MAXIMIZE) { ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE); return 0; }
-        if (wParam == OVERLAY_ACTION_CLOSE) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
-        return 0;
     case WM_MOUSEWHEEL:
         if(app->viewMode==hcv::ViewMode::Pixel100){
             RECT c{};GetClientRect(hwnd,&c);const int delta=GET_WHEEL_DELTA_WPARAM(wParam)/WHEEL_DELTA*60*(GET_KEYSTATE_WPARAM(wParam)&MK_SHIFT?-1:1);
@@ -1464,34 +1354,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         break;
     case WM_NCMOUSEMOVE:
-        if (app->overlayPolicy.auto_hide()) {
-            RECT outer{};
-            if (GetWindowRect(hwnd, &outer)) {
-                const auto in = app->visible_insets();
-                const int revealPx = hcv::reveal_strip_px(static_cast<int>(GetDpiForWindow(hwnd)));
-                const int visibleTop = outer.top + in.top;
-                if (GET_Y_LPARAM(lParam) <= visibleTop + revealPx) {
-                    app->overlayPolicy.reveal(GetTickCount64());
-                    app->update_overlay_visibility();
-                }
-            }
-        }
+        // Native Windows caption messages are handled by DefWindowProc.
         break;
-    case WM_MOUSEMOVE:
-        {
-            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0}; TrackMouseEvent(&tme);
-            // PotPlayer-style reveal zone: when auto-hide is active, moving
-            // into the top strip reveals the internal chrome. The overlay
-            // itself then keeps the policy alive while the pointer is over it.
-            if (app->overlayPolicy.auto_hide()) {
-                const auto in = app->visible_insets();
-                const int revealBottom = in.top + hcv::reveal_strip_px(static_cast<int>(GetDpiForWindow(hwnd)));
-                if (GET_Y_LPARAM(lParam) <= revealBottom) {
-                    app->overlayPolicy.reveal(GetTickCount64());
-                    app->update_overlay_visibility();
-                }
-            }
-        }
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tme);
+    }
         if(app->draggingMove){POINT cursor{};if(GetCursorPos(&cursor))SetWindowPos(hwnd,nullptr,
             app->moveWindowOrigin.left+cursor.x-app->moveCursorOrigin.x,
             app->moveWindowOrigin.top+cursor.y-app->moveCursorOrigin.y,0,0,
@@ -1667,13 +1535,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         state.selectedDevice = preferredDevice < state.devices.size() ? preferredDevice : 0;
         state.selectedMode = preferred_mode(state.devices[state.selectedDevice]);
     }
-    WNDCLASSW overlayClass{}; overlayClass.hInstance = instance; overlayClass.lpfnWndProc = overlay_proc;
-    overlayClass.lpszClassName = L"HcvChromeOverlay"; overlayClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    RegisterClassW(&overlayClass);
     WNDCLASSW wc{}; wc.hInstance = instance; wc.lpfnWndProc = window_proc; wc.lpszClassName = L"HcvPreviewWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
-    state.window = CreateWindowW(wc.lpszClassName, L"HDMI Capture Viewer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    state.window = CreateWindowW(wc.lpszClassName, L"HDMI Capture Viewer", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1920, 1080, nullptr, nullptr, instance, nullptr);
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
