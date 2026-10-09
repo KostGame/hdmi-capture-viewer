@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/9-win32-isolation-baseline
+      - agent/9-nowait-telemetry
   workflow_dispatch:
 
 jobs:
