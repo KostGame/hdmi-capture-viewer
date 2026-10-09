@@ -1,0 +1,64 @@
+name: HCV-005 diagnostic controls
+
+on:
+  push:
+    branches:
+      - agent/9-win32-isolation-baseline
+      - agent/9-nowait-telemetry
+  workflow_dispatch:
+
+jobs:
+  build-controls:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Validate diagnostic gates
+        shell: pwsh
+        run: |
+          python tests/test_hcv005_diagnostic_contract.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build pure native Win32 control A
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN src\win32_shell_probe.cpp /Fe:hcv005-win32-shell.exe user32.lib gdi32.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build custom chrome without video control B
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_NO_VIDEO /Isrc src\main.cpp /Fe:hcv005-viewer-no-video.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build capture only diagnostic C
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_CAPTURE_ONLY /Isrc src\main.cpp /Fe:hcv005-capture-only.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build static GPU diagnostic D
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_GPU_ONLY /Isrc src\main.cpp /Fe:hcv005-gpu-only.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build capture GPU without Present E
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_NO_PRESENT /Isrc src\main.cpp /Fe:hcv005-no-present.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build capture GPU with nonblocking Present F
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_ALWAYS_NOWAIT /Isrc src\main.cpp /Fe:hcv005-always-nowait.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload isolated A-B controls
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcv005-window-controls-x64
+          path: |
+            hcv005-win32-shell.exe
+            hcv005-viewer-no-video.exe
+            hcv005-capture-only.exe
+            hcv005-gpu-only.exe
+            hcv005-no-present.exe
+            hcv005-always-nowait.exe
+          if-no-files-found: error

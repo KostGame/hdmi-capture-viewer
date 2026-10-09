@@ -336,6 +336,7 @@ struct App {
     Clock::time_point lastInteractivePaint{};
     UINT swapWidth{}, swapHeight{};
     std::uint64_t resizeCount{}, resizeFailures{}, liveMoveFrames{}, skippedInteractivePresent{};
+    std::uint64_t nowaitPresentedFrames{}, nowaitSkippedFrames{}, nowaitOtherPresentFailures{};
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     hcv::ChromeMode savedChromeMode{hcv::ChromeMode::Normal};
@@ -755,6 +756,18 @@ struct App {
     }
 
     void render(bool consumeFrame, bool forceWithoutFrame = false, bool uiImmediate = false) {
+#if defined(HCV005_NO_VIDEO) || defined(HCV005_CAPTURE_ONLY)
+#ifdef HCV005_CAPTURE_ONLY
+        // Diagnostic C: drain frames on the UI thread, no D3D calls.
+        if (consumeFrame) pending.take();
+        (void)forceWithoutFrame; (void)uiImmediate;
+        return;
+#endif
+        // Diagnostic control B: preserve the original HWND, custom chrome and
+        // message handlers, but completely bypass D3D/capture processing.
+        (void)consumeFrame; (void)forceWithoutFrame; (void)uiImmediate;
+        return;
+#endif
         if (!window || IsIconic(window)) return;
         if (!d3d && !init_d3d()) { set_status(L"Direct3D 11 initialization failed."); return; }
         auto frame = consumeFrame ? pending.take() : std::optional<hcv::Frame>{};
@@ -858,14 +871,34 @@ struct App {
             // Waiting for VSync inside Windows' modal drag loop stalls mouse
             // tracking. Keep the user's VSync preference for normal playback.
             const bool nonblockingPresent = interactiveMoveResize || draggingMove || uiImmediate;
+#if defined(HCV005_NO_PRESENT)
+            // Isolate capture/upload/YUY2 rendering without DXGI presentation.
+            const HRESULT presentResult = S_OK;
+#elif defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)
+            // Release default: avoid blocking the Win32 UI thread on presentation.
+            const HRESULT presentResult = swapChain->Present(0u, DXGI_PRESENT_DO_NOT_WAIT);
+#else
             const HRESULT presentResult = swapChain->Present(
                 nonblockingPresent ? 0u : (vsyncEnabled ? 1u : 0u),
                 nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
+#endif
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
+#if defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)
+            if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
+                ++nowaitSkippedFrames;
+                return;
+            }
+            if (FAILED(presentResult)) {
+                ++nowaitOtherPresentFailures;
+                return;
+            }
+            ++nowaitPresentedFrames;
+#else
             if (nonblockingPresent && presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
                 ++skippedInteractivePresent;
                 return;
             }
+#endif
         }
         if (frame) {
             if (interactiveMoveResize) ++liveMoveFrames;
@@ -881,9 +914,20 @@ struct App {
                 std::to_wstring(yuy2ConvertSubmitMs) + L"ms CPU; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
                 std::to_wstring(static_cast<int>(captureCopyMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
                 std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
-                (vsyncEnabled ? L"on" : L"off") + L"; resize " +
+                (
+#if defined(HCV005_LEGACY_PRESENT) && !defined(HCV005_ALWAYS_NOWAIT)
+                vsyncEnabled ? L"on" : L"off"
+#else
+                L"nonblocking"
+#endif
+                ) + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
+#if defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)
+                L"; nowait presented " + std::to_wstring(nowaitPresentedFrames) +
+                L"/skipped " + std::to_wstring(nowaitSkippedFrames) +
+                L"/errors " + std::to_wstring(nowaitOtherPresentFailures) +
+#endif
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
                 L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
                 L" overlay " + (overlayPolicy.visible()?L"visible":L"hidden") +
@@ -991,7 +1035,11 @@ struct App {
         AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::Fullscreen ? MF_CHECKED : 0), 3001, L"Fullscreen (F11)");
         AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::BorderlessWindow ? MF_CHECKED : 0), 3009, L"Auto-hide chrome (Ctrl+B)");
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
+        #if defined(HCV005_LEGACY_PRESENT) && !defined(HCV005_ALWAYS_NOWAIT)
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
+#else
+        AppendMenuW(windowMenu, MF_STRING | MF_GRAYED, 3003, L"Nonblocking presentation (always on)");
+#endif
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
         AppendMenuW(windowMenu, MF_STRING, 3011, L"Keyboard help (F1)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Auto?MF_CHECKED:0), 3010, L"Auto / whole frame (Shift+F10)");
@@ -1281,6 +1329,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         app->interactive_tick(); // Synchronous progress even if posted frame messages stall.
         return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_TIMER:
+#ifdef HCV005_GPU_ONLY
+        if (wParam == 31005) {
+            app->render(false, true, true);
+            return 0;
+        }
+#endif
         if (wParam == LIVE_MOVE_TIMER) {
             app->interactive_tick();
             return 0;
@@ -1302,6 +1356,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         BeginPaint(hwnd, &ps);
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->paint();
+#if defined(HCV005_NO_VIDEO) || defined(HCV005_CAPTURE_ONLY)
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        FillRect(ps.hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        SetBkMode(ps.hdc, TRANSPARENT);
+        SetTextColor(ps.hdc, RGB(240, 240, 240));
+        DrawTextW(ps.hdc, L"HCV005 diagnostic - no video rendering", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+#endif
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1467,7 +1528,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if (id == 3001) { app->toggle_chrome(hcv::ChromeMode::Fullscreen); return 0; }
         if (id == 3009) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
         if (id == 3003) {
+#if defined(HCV005_LEGACY_PRESENT) && !defined(HCV005_ALWAYS_NOWAIT)
             app->vsyncEnabled = !app->vsyncEnabled;
+#else
+            return 0;
+#endif
             app->rebuild_menus();
             // Recompute the diagnostic label on the next captured frame.
             app->lastTitleUpdate = {};
@@ -1570,9 +1635,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         CW_USEDEFAULT, CW_USEDEFAULT, 1920, 1080, nullptr, nullptr, instance, nullptr);
     if (!state.window) { MFShutdown(); CoUninitialize(); return 1; }
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
+#ifdef HCV005_NO_VIDEO
+    state.set_status(L"HCV005 diagnostic: capture and D3D rendering intentionally disabled.");
+#elif defined(HCV005_CAPTURE_ONLY)
+    state.set_status(L"HCV005 capture-only: frames received but GPU disabled.");
+    if (!state.devices.empty()) state.start_capture();
+#elif defined(HCV005_GPU_ONLY)
+    state.set_status(L"HCV005 GPU-only: no capture, static D3D11 redraw.");
+    SetTimer(state.window, 31005, 33, nullptr);
+#else
     if (state.devices.empty()) state.set_status(L"No supported UVC capture device found. Connect one, then use Window > Rescan devices.");
     else if (preferredDevice < state.devices.size() || state.devices.size() == 1) state.start_capture();
     else state.set_status(L"Multiple video devices found. Choose the HDMI capture device from the Device menu.");
+#endif
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (handle_app_shortcut(state, msg)) continue;
