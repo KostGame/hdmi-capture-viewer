@@ -17,6 +17,11 @@ assert "const HRESULT presentResult = S_OK;" in src
 assert "#elif defined(HCV005_ALWAYS_NOWAIT)" in src
 assert "swapChain->Present(0u, DXGI_PRESENT_DO_NOT_WAIT)" in src
 assert "hcv005-no-present.exe" in wf and "hcv005-always-nowait.exe" in wf
+assert "if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING)" in src
+assert "++nowaitSkippedFrames;" in src
+assert "++nowaitPresentedFrames;" in src
+assert "++nowaitOtherPresentFailures;" in src
+assert "nowait presented " in src and "nowaitOtherPresentFailures" in src
 assert "void render(bool consumeFrame" in src
 assert "#else\n    if (state.devices.empty())" in src
 assert 'state.start_capture();\n    else state.set_status(' in src

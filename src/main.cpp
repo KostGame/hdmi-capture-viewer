@@ -336,6 +336,7 @@ struct App {
     Clock::time_point lastInteractivePaint{};
     UINT swapWidth{}, swapHeight{};
     std::uint64_t resizeCount{}, resizeFailures{}, liveMoveFrames{}, skippedInteractivePresent{};
+    std::uint64_t nowaitPresentedFrames{}, nowaitSkippedFrames{}, nowaitOtherPresentFailures{};
     HRESULT lastResizeError{S_OK};
     WINDOWPLACEMENT savedPlacement{sizeof(WINDOWPLACEMENT)};
     hcv::ChromeMode savedChromeMode{hcv::ChromeMode::Normal};
@@ -882,10 +883,22 @@ struct App {
                 nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
 #endif
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
+#ifdef HCV005_ALWAYS_NOWAIT
+            if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
+                ++nowaitSkippedFrames;
+                return;
+            }
+            if (FAILED(presentResult)) {
+                ++nowaitOtherPresentFailures;
+                return;
+            }
+            ++nowaitPresentedFrames;
+#else
             if (nonblockingPresent && presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
                 ++skippedInteractivePresent;
                 return;
             }
+#endif
         }
         if (frame) {
             if (interactiveMoveResize) ++liveMoveFrames;
@@ -904,6 +917,11 @@ struct App {
                 (vsyncEnabled ? L"on" : L"off") + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
+#ifdef HCV005_ALWAYS_NOWAIT
+                L"; nowait presented " + std::to_wstring(nowaitPresentedFrames) +
+                L"/skipped " + std::to_wstring(nowaitSkippedFrames) +
+                L"/errors " + std::to_wstring(nowaitOtherPresentFailures) +
+#endif
                 L"; last resize hr " + std::to_wstring(static_cast<unsigned long>(lastResizeError)) +
                 L"; chrome " + (hcv::chrome_state(chromeMode)==hcv::ChromeState::NormalPinned?L"NormalPinned":hcv::chrome_state(chromeMode)==hcv::ChromeState::BorderlessAutoHide?L"BorderlessAutoHide":L"FullscreenAutoHide") +
                 L" overlay " + (overlayPolicy.visible()?L"visible":L"hidden") +
