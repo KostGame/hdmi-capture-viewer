@@ -44,7 +44,9 @@ jobs:
       - name: Build native x64 application
         shell: pwsh
         run: |
-          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp /Fe:hdmi-capture-viewer.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          rc /nologo /fo hcv-icon.res resources\hcv-icon.rc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /Isrc src\main.cpp hcv-icon.res /Fe:hdmi-capture-viewer.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate embedded YUY2 GPU pixel shader
         shell: pwsh
