@@ -870,9 +870,17 @@ struct App {
             // Waiting for VSync inside Windows' modal drag loop stalls mouse
             // tracking. Keep the user's VSync preference for normal playback.
             const bool nonblockingPresent = interactiveMoveResize || draggingMove || uiImmediate;
+#if defined(HCV005_NO_PRESENT)
+            // Isolate capture/upload/YUY2 rendering without DXGI presentation.
+            const HRESULT presentResult = S_OK;
+#elif defined(HCV005_ALWAYS_NOWAIT)
+            // Isolate blocking VSync present; never stall on DXGI present queue.
+            const HRESULT presentResult = swapChain->Present(0u, DXGI_PRESENT_DO_NOT_WAIT);
+#else
             const HRESULT presentResult = swapChain->Present(
                 nonblockingPresent ? 0u : (vsyncEnabled ? 1u : 0u),
                 nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
+#endif
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
             if (nonblockingPresent && presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
                 ++skippedInteractivePresent;

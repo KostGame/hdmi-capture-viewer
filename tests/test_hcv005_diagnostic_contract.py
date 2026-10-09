@@ -12,6 +12,11 @@ assert "HCV005_NO_VIDEO) || defined(HCV005_CAPTURE_ONLY)" in src
 assert "HCV005 diagnostic - no video rendering" in src
 assert "HCV005_CAPTURE_ONLY" in src and "HCV005_GPU_ONLY" in src
 assert "SetTimer(state.window, 31005, 33, nullptr)" in src
+assert "#if defined(HCV005_NO_PRESENT)" in src
+assert "const HRESULT presentResult = S_OK;" in src
+assert "#elif defined(HCV005_ALWAYS_NOWAIT)" in src
+assert "swapChain->Present(0u, DXGI_PRESENT_DO_NOT_WAIT)" in src
+assert "hcv005-no-present.exe" in wf and "hcv005-always-nowait.exe" in wf
 assert "void render(bool consumeFrame" in src
 assert "#else\n    if (state.devices.empty())" in src
 assert 'state.start_capture();\n    else state.set_status(' in src
