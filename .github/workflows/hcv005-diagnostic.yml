@@ -29,6 +29,16 @@ jobs:
         run: |
           cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_NO_VIDEO /Isrc src\main.cpp /Fe:hcv005-viewer-no-video.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build capture only diagnostic C
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_CAPTURE_ONLY /Isrc src\main.cpp /Fe:hcv005-capture-only.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build static GPU diagnostic D
+        shell: pwsh
+        run: |
+          cl /nologo /utf-8 /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DHCV005_GPU_ONLY /Isrc src\main.cpp /Fe:hcv005-gpu-only.exe mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib d3dcompiler.lib ole32.lib user32.lib gdi32.lib shcore.lib /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload isolated A-B controls
         uses: actions/upload-artifact@v4
         with:
@@ -36,4 +46,6 @@ jobs:
           path: |
             hcv005-win32-shell.exe
             hcv005-viewer-no-video.exe
+            hcv005-capture-only.exe
+            hcv005-gpu-only.exe
           if-no-files-found: error

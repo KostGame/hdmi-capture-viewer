@@ -7,8 +7,11 @@ wf=Path(".github/workflows/hcv005-diagnostic.yml").read_text(encoding="utf-8")
 for name in ("#ifdef HCV005_NO_VIDEO", "Diagnostic control B",
              "capture and D3D rendering intentionally disabled"):
     assert name in src, name
-assert src.count("#ifdef HCV005_NO_VIDEO") == 3
-assert "HCV005 - diagnostic viewer, video disabled" in src
+assert src.count("#ifdef HCV005_NO_VIDEO") == 1
+assert "HCV005_NO_VIDEO) || defined(HCV005_CAPTURE_ONLY)" in src
+assert "HCV005 diagnostic - no video rendering" in src
+assert "HCV005_CAPTURE_ONLY" in src and "HCV005_GPU_ONLY" in src
+assert "SetTimer(state.window, 31005, 33, nullptr)" in src
 assert "void render(bool consumeFrame" in src
 assert "#else\n    if (state.devices.empty())" in src
 assert 'state.start_capture();\n    else state.set_status(' in src

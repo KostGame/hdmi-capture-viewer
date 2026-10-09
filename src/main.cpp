@@ -755,7 +755,13 @@ struct App {
     }
 
     void render(bool consumeFrame, bool forceWithoutFrame = false, bool uiImmediate = false) {
-#ifdef HCV005_NO_VIDEO
+#if defined(HCV005_NO_VIDEO) || defined(HCV005_CAPTURE_ONLY)
+#ifdef HCV005_CAPTURE_ONLY
+        // Diagnostic C: drain frames on the UI thread, no D3D calls.
+        if (consumeFrame) pending.take();
+        (void)forceWithoutFrame; (void)uiImmediate;
+        return;
+#endif
         // Diagnostic control B: preserve the original HWND, custom chrome and
         // message handlers, but completely bypass D3D/capture processing.
         (void)consumeFrame; (void)forceWithoutFrame; (void)uiImmediate;
@@ -1287,6 +1293,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         app->interactive_tick(); // Synchronous progress even if posted frame messages stall.
         return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_TIMER:
+#ifdef HCV005_GPU_ONLY
+        if (wParam == 31005) {
+            app->render(false, true, true);
+            return 0;
+        }
+#endif
         if (wParam == LIVE_MOVE_TIMER) {
             app->interactive_tick();
             return 0;
@@ -1308,12 +1320,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         BeginPaint(hwnd, &ps);
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->paint();
-#ifdef HCV005_NO_VIDEO
+#if defined(HCV005_NO_VIDEO) || defined(HCV005_CAPTURE_ONLY)
         RECT rc{}; GetClientRect(hwnd, &rc);
         FillRect(ps.hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         SetBkMode(ps.hdc, TRANSPARENT);
         SetTextColor(ps.hdc, RGB(240, 240, 240));
-        DrawTextW(ps.hdc, L"HCV005 - diagnostic viewer, video disabled", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(ps.hdc, L"HCV005 diagnostic - no video rendering", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 #endif
         EndPaint(hwnd, &ps);
         return 0;
@@ -1585,6 +1597,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     state.rebuild_menus(); ShowWindow(state.window, show); UpdateWindow(state.window);
 #ifdef HCV005_NO_VIDEO
     state.set_status(L"HCV005 diagnostic: capture and D3D rendering intentionally disabled.");
+#elif defined(HCV005_CAPTURE_ONLY)
+    state.set_status(L"HCV005 capture-only: frames received but GPU disabled.");
+    if (!state.devices.empty()) state.start_capture();
+#elif defined(HCV005_GPU_ONLY)
+    state.set_status(L"HCV005 GPU-only: no capture, static D3D11 redraw.");
+    SetTimer(state.window, 31005, 33, nullptr);
 #else
     if (state.devices.empty()) state.set_status(L"No supported UVC capture device found. Connect one, then use Window > Rescan devices.");
     else if (preferredDevice < state.devices.size() || state.devices.size() == 1) state.start_capture();
