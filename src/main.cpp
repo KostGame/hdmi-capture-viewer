@@ -874,8 +874,8 @@ struct App {
 #if defined(HCV005_NO_PRESENT)
             // Isolate capture/upload/YUY2 rendering without DXGI presentation.
             const HRESULT presentResult = S_OK;
-#elif defined(HCV005_ALWAYS_NOWAIT)
-            // Isolate blocking VSync present; never stall on DXGI present queue.
+#elif defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)
+            // Release default: avoid blocking the Win32 UI thread on presentation.
             const HRESULT presentResult = swapChain->Present(0u, DXGI_PRESENT_DO_NOT_WAIT);
 #else
             const HRESULT presentResult = swapChain->Present(
@@ -883,7 +883,7 @@ struct App {
                 nonblockingPresent ? DXGI_PRESENT_DO_NOT_WAIT : 0u);
 #endif
             presentMs = std::chrono::duration<double, std::milli>(Clock::now() - presentStart).count();
-#ifdef HCV005_ALWAYS_NOWAIT
+#if defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)
             if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING) {
                 ++nowaitSkippedFrames;
                 return;
@@ -914,10 +914,16 @@ struct App {
                 std::to_wstring(yuy2ConvertSubmitMs) + L"ms CPU; app age " + std::to_wstring(static_cast<int>(submitMs)) + L"ms; capture copy/convert " +
                 std::to_wstring(static_cast<int>(captureCopyMs)) + L"ms; Present CPU " + std::to_wstring(static_cast<int>(presentMs)) + L"ms; capture p95 " +
                 std::to_wstring(static_cast<int>(measuredCaptureP95)) + L"ms; vsync " +
-                (vsyncEnabled ? L"on" : L"off") + L"; resize " +
+                (
+#if defined(HCV005_LEGACY_PRESENT) && !defined(HCV005_ALWAYS_NOWAIT)
+                vsyncEnabled ? L"on" : L"off"
+#else
+                L"nonblocking"
+#endif
+                ) + L"; resize " +
                 std::to_wstring(resizeCount) + L"/fail " + std::to_wstring(resizeFailures) +
                 L"/skipped interactive presents " + std::to_wstring(skippedInteractivePresent) +
-#ifdef HCV005_ALWAYS_NOWAIT
+#if defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)
                 L"; nowait presented " + std::to_wstring(nowaitPresentedFrames) +
                 L"/skipped " + std::to_wstring(nowaitSkippedFrames) +
                 L"/errors " + std::to_wstring(nowaitOtherPresentFailures) +
@@ -1029,7 +1035,11 @@ struct App {
         AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::Fullscreen ? MF_CHECKED : 0), 3001, L"Fullscreen (F11)");
         AppendMenuW(windowMenu, MF_STRING | (chromeMode == hcv::ChromeMode::BorderlessWindow ? MF_CHECKED : 0), 3009, L"Auto-hide chrome (Ctrl+B)");
         AppendMenuW(windowMenu, MF_STRING, 3002, L"Rescan devices");
+        #if defined(HCV005_LEGACY_PRESENT) && !defined(HCV005_ALWAYS_NOWAIT)
         AppendMenuW(windowMenu, MF_STRING | (vsyncEnabled ? MF_CHECKED : 0), 3003, L"VSync (off may tear)");
+#else
+        AppendMenuW(windowMenu, MF_STRING | MF_GRAYED, 3003, L"Nonblocking presentation (always on)");
+#endif
         AppendMenuW(windowMenu, MF_STRING, 3004, L"Show metrics (F2)");
         AppendMenuW(windowMenu, MF_STRING, 3011, L"Keyboard help (F1)");
         AppendMenuW(windowMenu, MF_STRING | (viewMode==hcv::ViewMode::Auto?MF_CHECKED:0), 3010, L"Auto / whole frame (Shift+F10)");
@@ -1518,7 +1528,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         if (id == 3001) { app->toggle_chrome(hcv::ChromeMode::Fullscreen); return 0; }
         if (id == 3009) { app->toggle_chrome(hcv::ChromeMode::BorderlessWindow); return 0; }
         if (id == 3003) {
+#if defined(HCV005_LEGACY_PRESENT) && !defined(HCV005_ALWAYS_NOWAIT)
             app->vsyncEnabled = !app->vsyncEnabled;
+#else
+            return 0;
+#endif
             app->rebuild_menus();
             // Recompute the diagnostic label on the next captured frame.
             app->lastTitleUpdate = {};

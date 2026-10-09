@@ -16,6 +16,9 @@ assert "#if defined(HCV005_NO_PRESENT)" in src
 assert "const HRESULT presentResult = S_OK;" in src
 assert "#elif defined(HCV005_ALWAYS_NOWAIT)" in src
 assert "swapChain->Present(0u, DXGI_PRESENT_DO_NOT_WAIT)" in src
+assert "#elif defined(HCV005_ALWAYS_NOWAIT) || !defined(HCV005_LEGACY_PRESENT)" in src
+assert "Nonblocking presentation (always on)" in src
+assert "MF_GRAYED, 3003" in src
 assert "hcv005-no-present.exe" in wf and "hcv005-always-nowait.exe" in wf
 assert "if (presentResult == DXGI_ERROR_WAS_STILL_DRAWING)" in src
 assert "++nowaitSkippedFrames;" in src
