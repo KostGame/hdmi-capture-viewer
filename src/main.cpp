@@ -1308,6 +1308,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         BeginPaint(hwnd, &ps);
         if (app->interactiveMoveResize) app->interactive_tick();
         else app->paint();
+#ifdef HCV005_NO_VIDEO
+        RECT rc{}; GetClientRect(hwnd, &rc);
+        FillRect(ps.hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        SetBkMode(ps.hdc, TRANSPARENT);
+        SetTextColor(ps.hdc, RGB(240, 240, 240));
+        DrawTextW(ps.hdc, L"HCV005 - diagnostic viewer, video disabled", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+#endif
         EndPaint(hwnd, &ps);
         return 0;
     }
